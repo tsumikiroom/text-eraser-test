@@ -184,7 +184,7 @@ input[type=range]::-moz-range-thumb {
         <button data-fill="smooth">Smooth</button>
       </div>
     </div>
-    <label class="knob"><span>Size</span><input id="size" type="range" min="256" max="960" step="32" value="480" style="--tick: 4.5455%"><output id="sizeOut">480</output></label>
+    <label class="knob"><span>Size</span><input id="size" type="range" min="256" max="960" step="32" value="640" style="--tick: 4.5455%"><output id="sizeOut">640</output></label>
     <label class="knob"><span>Rate</span><input id="rate" type="range" min="1" max="15" step="1" value="5" style="--tick: 7.1429%"><output id="rateOut">5/s</output></label>
     <label class="knob"><span>Pad</span><input id="pad" type="range" min="0" max="80" step="5" value="10" style="--tick: 6.25%"><output id="padOut">10%</output></label>
   </div>
@@ -212,13 +212,16 @@ void main() {
 <script type="x-shader/x-vertex" id="v-box">#version 300 es
 // One text box drawn into the mask: unit quad stretched to the box plus its soft edge (pixels of the mask).
 in vec2 aPos;
-uniform vec4 uRect;     // inner rect x0, y0, x1, y1 (already padded)
+uniform vec4 uRect;     // inner rect x0, y0, x1, y1 (already padded), before turning
 uniform float uFeather;
+uniform float uAng;     // the box is turned by this angle around its centre (follows the camera's roll)
 uniform vec2 uRes;
-out vec2 vPx;
+out vec2 vPx;           // position in the box's own (unturned) frame
 void main() {
   vPx = mix(uRect.xy - uFeather, uRect.zw + uFeather, aPos * 0.5 + 0.5);
-  gl_Position = vec4(vPx / uRes * 2.0 - 1.0, 0.0, 1.0);
+  vec2 c = (uRect.xy + uRect.zw) * 0.5, d = vPx - c;
+  vec2 p = c + vec2(cos(uAng) * d.x - sin(uAng) * d.y, sin(uAng) * d.x + cos(uAng) * d.y);
+  gl_Position = vec4(p / uRes * 2.0 - 1.0, 0.0, 1.0);
 }
 </script>
 <script type="x-shader/x-fragment" id="f-box">#version 300 es
@@ -430,13 +433,13 @@ else {
   };
   try {
     P.gray = link('v-full', 'f-gray', ['uLive']);
-    P.box = link('v-box', 'f-box', ['uRect', 'uFeather', 'uAlpha', 'uRes']);
+    P.box = link('v-box', 'f-box', ['uRect', 'uFeather', 'uAng', 'uAlpha', 'uRes']);
     P.seed = link('v-full', 'f-seed', ['uLive', 'uMask']);
     P.down = link('v-full', 'f-down', ['uSrc']);
     P.up = link('v-full', 'f-up', ['uFine', 'uCoarse']);
     P.jseed = link('v-full', 'f-jseed', ['uMask']);
     P.jstep = link('v-full', 'f-jstep', ['uSrc', 'uStep']);
-    P.solid = link('v-box', 'f-solid', ['uRect', 'uFeather', 'uRes', 'uColor']);
+    P.solid = link('v-box', 'f-solid', ['uRect', 'uFeather', 'uAng', 'uRes', 'uColor']);
     P.stretch = link('v-full', 'f-stretch', ['uSeeds', 'uLive']);
     P.show = link('v-screen', 'f-show', ['uLive', 'uMask', 'uFill', 'uErase', 'uCover', 'uMirror']);
   } catch (e) {
@@ -499,7 +502,7 @@ function allocWork(vw, vh) {
   W.tw = Math.max(8, Math.round(vw * kt)); W.th = Math.max(8, Math.round(vh * kt));
   W.gray = makeTarget(W.tw, W.th);
   W.px = new Uint8Array(W.tw * W.th * 4);
-  T.prev = null; T.cur = null;
+  T.prev = null; T.cur = null; T.pyr = null; T.ppyr = null; T.key = null; T.mk = [1, 0, 0, 0]; T.vel = [1, 0, 0, 0]; T.hist = [];
   W.vw = vw; W.vh = vh;
 }
 
@@ -534,44 +537,111 @@ function stopSource() {
   video.srcObject = null;
 }
 
-function makeTestStream() {
-  // A slowly drifting street-ish scene with signs, used instead of a camera (?test=1)
-  if (!testCanvas) {
-    testCanvas = document.createElement('canvas');
-    testCanvas.width = 960; testCanvas.height = 540;
-    const g = testCanvas.getContext('2d');
-    const t0 = performance.now();
-    const signs = [
-      { x: 60, y: 60, w: 330, h: 120, bg: '#f4f1e8', fg: '#1a1a1a', lines: ['OPEN DAILY', '10:00 - 20:00'], font: 'bold 40px sans-serif' },
-      { x: 520, y: 40, w: 360, h: 90, bg: '#1d3b2a', fg: '#ffffff', lines: ['出口 EXIT →'], font: 'bold 50px sans-serif' },
-      { x: 480, y: 210, w: 380, h: 170, bg: '#d94f30', fg: '#fff7e0', lines: ['SALE', 'up to 50% off'], font: 'bold 54px serif' },
-      { x: 90, y: 260, w: 300, h: 200, bg: '#fafafa', fg: '#333', lines: ['Lorem ipsum dolor', 'sit amet, consectetur', 'adipiscing elit. 本日', 'のおすすめ'], font: '26px sans-serif' },
-    ];
-    const draw = () => {
-      const t = (performance.now() - t0) / 1000;
-      g.setTransform(1, 0, 0, 1, 0, 0);
-      const sky = g.createLinearGradient(0, 0, 0, 540);
-      sky.addColorStop(0, '#8fb3c9'); sky.addColorStop(1, '#c9b79c');
-      g.fillStyle = sky; g.fillRect(0, 0, 960, 540);
-      // drift + small jitter like a handheld phone
-      const dx = Math.sin(t * 0.4) * 40 + Math.sin(t * 7.1) * 1.5, dy = Math.cos(t * 0.3) * 20 + Math.cos(t * 6.3) * 1.5;
-      g.setTransform(1, 0, 0, 1, dx, dy);
-      for (let y = -60; y < 600; y += 30) for (let x = -60 + ((y / 30) % 2) * 30; x < 1020; x += 60) { // brick wall
-        g.fillStyle = `hsl(${18 + ((x * 7 + y * 3) % 11)} 35% ${42 + ((x * 13 + y * 5) % 9)}%)`;
-        g.fillRect(x, y, 58, 28);
-      }
-      for (const s of signs) {
-        g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(s.x + 6, s.y + 6, s.w, s.h);
-        g.fillStyle = s.bg; g.fillRect(s.x, s.y, s.w, s.h);
-        g.fillStyle = s.fg; g.font = s.font; g.textBaseline = 'middle';
-        const lh = s.h / (s.lines.length + 0.6);
-        s.lines.forEach((l, i) => g.fillText(l, s.x + 20, s.y + lh * (i + 0.8)));
-      }
-      requestAnimationFrame(draw);
-    };
-    draw();
+// Test scene (?test=1): a street-ish wall with signs, drawn straight into the frame loop instead of a camera, so
+// the true position of every text line is known for the frame being processed. ?motion=fast adds fast panning,
+// zoom and a little rotation, like a phone moved by hand.
+const MOTION = params.get('motion') === 'fast' ? 'fast' : 'slow', SCENE_SCALE = +params.get('scale') || 1; // ?scale=0.5: smaller text
+let testScene = null;
+function sceneMatrix(t) {
+  let dx, dy, sc = 1, r = 0;
+  if (MOTION === 'fast') {
+    dx = Math.sin(t * 1.3) * 110 + Math.sin(t * 7.1) * 3; dy = Math.cos(t * 1.1) * 55 + Math.cos(t * 6.3) * 3;
+    sc = 1 + 0.15 * Math.sin(t * 0.9); r = 0.06 * Math.sin(t * 0.7);
+  } else {
+    dx = Math.sin(t * 0.4) * 40 + Math.sin(t * 7.1) * 1.5; dy = Math.cos(t * 0.3) * 20 + Math.cos(t * 6.3) * 1.5;
   }
-  return testCanvas.captureStream(30);
+  sc *= SCENE_SCALE;
+  const c = Math.cos(r) * sc, sn = Math.sin(r) * sc;
+  return [c, sn, -sn, c, 480 + dx - c * 480 + sn * 270, 270 + dy - sn * 480 - c * 270]; // canvas setTransform order
+}
+function makeTestScene() {
+  testCanvas = testCanvas || document.createElement('canvas');
+  testCanvas.width = 960; testCanvas.height = 540;
+  const g = testCanvas.getContext('2d');
+  const signs = [
+    { x: 60, y: 60, w: 330, h: 120, bg: '#f4f1e8', fg: '#1a1a1a', lines: ['OPEN DAILY', '10:00 - 20:00'], font: 'bold 40px sans-serif' },
+    { x: 520, y: 40, w: 360, h: 90, bg: '#1d3b2a', fg: '#ffffff', lines: ['出口 EXIT →'], font: 'bold 50px sans-serif' },
+    { x: 480, y: 210, w: 380, h: 170, bg: '#d94f30', fg: '#fff7e0', lines: ['SALE', 'up to 50% off'], font: 'bold 54px serif' },
+    { x: 90, y: 260, w: 300, h: 200, bg: '#fafafa', fg: '#333', lines: ['Lorem ipsum dolor', 'sit amet, consectetur', 'adipiscing elit. 本日', 'のおすすめ'], font: '26px sans-serif' },
+    { x: 560, y: 420, w: 300, h: 70, bg: '#f2e6c9', fg: '#3a2a1a', lines: ['Small print: open 7 days', 'tel 03-1234-5678'], font: '16px sans-serif' },
+  ];
+  // tight glyph boxes of every line, in scene pixels (the "answer" the erase is scored against)
+  const lines = [];
+  for (const sg of signs) {
+    g.font = sg.font; g.textBaseline = 'middle';
+    const lh = sg.h / (sg.lines.length + 0.6);
+    sg.lines.forEach((l, i) => {
+      const m = g.measureText(l), x = sg.x + 20, y = sg.y + lh * (i + 0.8);
+      lines.push({ x0: x - m.actualBoundingBoxLeft, x1: x + m.actualBoundingBoxRight, y0: y - m.actualBoundingBoxAscent, y1: y + m.actualBoundingBoxDescent, text: l });
+    });
+  }
+  testScene = { t0: performance.now(), g, signs, lines };
+}
+function drawTestScene(t) {
+  const { g, signs } = testScene;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  const sky = g.createLinearGradient(0, 0, 0, 540);
+  sky.addColorStop(0, '#8fb3c9'); sky.addColorStop(1, '#c9b79c');
+  g.fillStyle = sky; g.fillRect(0, 0, 960, 540);
+  g.setTransform(...sceneMatrix(t));
+  for (let y = -240; y < 780; y += 30) for (let x = -240 + (((y + 240) / 30) % 2) * 30; x < 1200; x += 60) { // brick wall
+    g.fillStyle = `hsl(${18 + (((x + 240) * 7 + (y + 240) * 3) % 11)} 35% ${42 + (((x + 240) * 13 + (y + 240) * 5) % 9)}%)`;
+    g.fillRect(x, y, 58, 28);
+  }
+  for (const s of signs) {
+    g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(s.x + 6, s.y + 6, s.w, s.h);
+    g.fillStyle = s.bg; g.fillRect(s.x, s.y, s.w, s.h);
+    g.fillStyle = s.fg; g.font = s.font; g.textBaseline = 'middle';
+    const lh = s.h / (s.lines.length + 0.6);
+    s.lines.forEach((l, i) => g.fillText(l, s.x + 20, s.y + lh * (i + 0.8)));
+  }
+}
+// Test only: how far the estimated frame-to-frame motion puts points, compared with the scene's true motion
+// (mean over a 5x3 grid, in tracking pixels).
+function motionError(t1, t2, m) {
+  const A = sceneMatrix(t1), B = sceneMatrix(t2), k = W.tw / 960;
+  const det = A[0] * A[3] - A[1] * A[2];
+  let e = 0;
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 5; i++) {
+    const X = (i + 0.5) / 5 * 960, Y = (j + 0.5) / 3 * 540; // video pixel at t1 -> scene point -> video pixel at t2
+    const dx = X - A[4], dy = Y - A[5];
+    const sx = (A[3] * dx - A[2] * dy) / det, sy = (-A[1] * dx + A[0] * dy) / det;
+    const tx = (B[0] * sx + B[2] * sy + B[4]) * k, ty = (B[1] * sx + B[3] * sy + B[5]) * k;
+    const x = X * k, y = Y * k;
+    e += Math.hypot(m[0] * x - m[1] * y + m[2] - tx, m[1] * x + m[0] * y + m[3] - ty);
+  }
+  SCORE.merr += e / 15; SCORE.mn++;
+}
+// Score of the current frame: the share of text (points spread over every visible line's glyph box) that lies
+// under an erase box, and the share of lines that are erased almost fully.
+const SCORE = { frames: 0, cov: 0, full: 0, lines: 0, merr: 0, mn: 0 };
+function scoreFrame(t) {
+  const M = sceneMatrix(t), mw = W.mask.w, mh = W.mask.h;
+  const sa = viewW / viewH, va = W.vw / W.vh, c = va > sa ? [sa / va, 1] : [1, va / sa];
+  const vis = [0.5 - c[0] / 2, 0.5 - c[1] / 2, 0.5 + c[0] / 2, 0.5 + c[1] / 2]; // only text that is on screen counts
+  const rects = boxes.filter((b) => b.alpha > 0.5).map((b) => {
+    const p = Math.min(b.w * mw, b.h * mh) * pad;
+    return { cx: (b.x + b.w / 2) * mw, cy: (b.y + b.h / 2) * mh, hw: b.w * mw / 2 + p, hh: b.h * mh / 2 + p, c: Math.cos(b.a || 0), s: Math.sin(b.a || 0) };
+  });
+  const inside = (u, v) => rects.some((r) => {
+    const dx = u * mw - r.cx, dy = v * mh - r.cy;
+    return Math.abs(r.c * dx + r.s * dy) <= r.hw && Math.abs(-r.s * dx + r.c * dy) <= r.hh;
+  });
+  let cov = 0, full = 0, n = 0;
+  for (const l of testScene.lines) {
+    let hit = 0, tot = 0;
+    for (let j = 0; j < 3; j++) for (let i = 0; i < 12; i++) {
+      const x = l.x0 + (i + 0.5) / 12 * (l.x1 - l.x0), y = l.y0 + (j + 0.5) / 3 * (l.y1 - l.y0);
+      const u = (M[0] * x + M[2] * y + M[4]) / 960, v = (M[1] * x + M[3] * y + M[5]) / 540;
+      if (u < vis[0] || v < vis[1] || u > vis[2] || v > vis[3]) continue;
+      tot++;
+      if (inside(u, v)) hit++;
+    }
+    if (tot < 18) continue; // mostly off screen
+    n++; cov += hit / tot; if (hit / tot > 0.95) full++;
+  }
+  if (!n) return;
+  SCORE.frames++; SCORE.cov += cov / n; SCORE.full += full / n; SCORE.lines += n;
 }
 
 function explain(e) {
@@ -598,7 +668,10 @@ function openCamera(want, fallback) {
   let req;
   if (want === 'test') {
     stopSource();
-    req = Promise.resolve(makeTestStream());
+    makeTestScene();
+    facing = null; mirror = false;
+    started('test');
+    return;
   } else {
     if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       showError('The camera only works on HTTPS pages. Reopen this page from an https:// address.');
@@ -737,44 +810,121 @@ for (const b of dock.querySelectorAll('[data-engine]')) b.addEventListener('clic
 // ---------- boxes and tracking ----------
 // Boxes live in 0..1 of the video frame. Between detections they follow the picture by block matching
 // on a small gray copy of each frame.
-const T = { prev: null, cur: null, rgb: null };
+// Tracking. Boxes keep a "base" pose in a reference frame (the frame the latest detection looked at) and are
+// placed each frame by the motion from that reference frame straight to the current one. Measuring from the
+// reference (not frame to frame) keeps small errors from adding up while the camera moves.
+const T = { prev: null, cur: null, rgb: null, pyr: null, ppyr: null, key: null, mk: [1, 0, 0, 0], vel: [1, 0, 0, 0], frame: 0, hist: [] };
 let boxes = [];
 const FADE_IN = 0.06, FADE_OUT = 0.3, HOLD = 0.5; // HOLD: seconds a box stays fully on after the finder stops seeing it
 
-function trackBox(a, b, bx, R) {
-  const tw = W.tw, th = W.th;
-  const x0 = bx.x * tw, y0 = bx.y * th, bw = bx.w * tw, bh = bx.h * th;
-  const nx = Math.max(2, Math.min(16, Math.round(bw))), ny = Math.max(2, Math.min(12, Math.round(bh)));
-  const xs = [], ys = [];
-  for (let i = 0; i < nx; i++) xs.push(Math.round(x0 + (i + 0.5) * bw / nx));
-  for (let j = 0; j < ny; j++) ys.push(Math.round(y0 + (j + 0.5) * bh / ny));
-  // template from the previous frame; skip flat patches (nothing to lock on to)
-  const tpl = [], idx = [];
-  let mean = 0;
-  for (const y of ys) for (const x of xs) {
-    if (x < R || y < R || x >= tw - R || y >= th - R) continue;
-    const v = a[y * tw + x]; tpl.push(v); idx.push(y * tw + x); mean += v;
+// Whole-frame motion between two gray frames (or null when there is too little texture), as a similarity (move + zoom + turn): x' = a x - b y + tx,
+// y' = b x + a y + ty, in tracking pixels. Patches on a grid are matched coarse-to-fine over a 3-level pyramid
+// (so fast pans of 15+ px per frame are still found), starting from the previous frame's motion, then the
+// similarity is fitted to all of them while ignoring the ones that disagree (moving people, flat areas).
+function halve(g, w, h) {
+  const w2 = w >> 1, h2 = h >> 1, o = new Uint8Array(w2 * h2);
+  for (let y = 0; y < h2; y++) for (let x = 0; x < w2; x++) {
+    const i = 2 * y * w + 2 * x;
+    o[y * w2 + x] = (g[i] + g[i + 1] + g[i + w] + g[i + w + 1] + 2) >> 2;
   }
-  if (tpl.length < 4) return;
-  mean /= tpl.length;
-  let vari = 0; for (const v of tpl) vari += (v - mean) * (v - mean);
-  if (vari / tpl.length < 20) return;
-  const D = 2 * R + 1, cost = new Float32Array(D * D);
-  let best = Infinity, bi = 0;
-  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
-    const off = dy * tw + dx;
-    let s = 0;
-    for (let k = 0; k < idx.length; k++) s += Math.abs(b[idx[k] + off] - tpl[k]);
-    const ci = (dy + R) * D + dx + R;
-    cost[ci] = s;
-    if (s < best) { best = s; bi = ci; }
+  return o;
+}
+function pyramid(g) {
+  const L = [{ g, w: W.tw, h: W.th }];
+  for (let k = 1; k < 3; k++) { const p = L[k - 1]; L.push({ g: halve(p.g, p.w, p.h), w: p.w >> 1, h: p.h >> 1 }); }
+  return L;
+}
+function sad(A, B, w, h, x, y, ex, ey, r) {
+  // patch of radius r around (x, y) in A against the one around (ex, ey) in B; Infinity if B's patch leaves the frame
+  if (ex < r || ey < r || ex >= w - r || ey >= h - r) return Infinity;
+  let s = 0;
+  for (let j = -r; j <= r; j++) {
+    const ia = (y + j) * w + x, ib = (ey + j) * w + ex;
+    for (let i = -r; i <= r; i++) s += Math.abs(A[ia + i] - B[ib + i]);
   }
-  let dx = (bi % D) - R, dy = ((bi / D) | 0) - R;
-  // sub-pixel refinement by fitting a parabola through the neighbours
-  const cx = bi % D, cy = (bi / D) | 0;
-  if (cx > 0 && cx < D - 1) { const l = cost[bi - 1], r = cost[bi + 1], den = l - 2 * best + r; if (den > 0) dx += 0.5 * (l - r) / den; }
-  if (cy > 0 && cy < D - 1) { const u = cost[bi - D], d = cost[bi + D], den = u - 2 * best + d; if (den > 0) dy += 0.5 * (u - d) / den; }
-  bx.x += dx / tw; bx.y += dy / th;
+  return s;
+}
+function estimateMotion(P0, P1, guess) {
+  const w = W.tw, h = W.th, pts = [], c = new Float32Array(81);
+  const g0 = P0[0].g;
+  for (let y = 10; y < h - 10; y += 8) for (let x = 10; x < w - 10; x += 8) {
+    // texture check: a flat patch (sky, plain sign) cannot be matched
+    let mn = 255, mx = 0;
+    for (let j = -3; j <= 3; j += 3) for (let i = -3; i <= 3; i += 3) { const v = g0[(y + j) * w + x + i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (mx - mn < 18) continue;
+    // where the guess says this point went
+    const px = guess[0] * x - guess[1] * y + guess[2], py = guess[1] * x + guess[0] * y + guess[3];
+    let dx = (px - x) / 4, dy = (py - y) / 4, okp = true;
+    for (let lv = 2; lv >= 0; lv--) {
+      const A = P0[lv].g, B = P1[lv].g, lw = P0[lv].w, lh = P0[lv].h, f = 1 << lv;
+      const cx = Math.round(x / f), cy = Math.round(y / f), r = lv === 2 ? 2 : 3, R = lv === 2 ? 3 : 2;
+      if (cx < r || cy < r || cx >= lw - r || cy >= lh - r) { okp = false; break; }
+      const bx = Math.round(dx), by = Math.round(dy);
+      let best = Infinity, bi = 0, bj = 0;
+      for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) {
+        const v = sad(A, B, lw, lh, cx, cy, cx + bx + i, cy + by + j, r);
+        c[(j + R) * 9 + i + R] = v;
+        if (v < best) { best = v; bi = i; bj = j; }
+      }
+      if (best === Infinity) { okp = false; break; }
+      dx = bx + bi; dy = by + bj;
+      if (lv === 0) { // sub-pixel: parabola through the neighbours
+        const k = (bj + R) * 9 + bi + R;
+        if (Math.abs(bi) < R) { const l = c[k - 1], rr = c[k + 1], den = l - 2 * best + rr; if (den > 0 && isFinite(den)) dx += 0.5 * (l - rr) / den; }
+        if (Math.abs(bj) < R) { const u = c[k - 9], d = c[k + 9], den = u - 2 * best + d; if (den > 0 && isFinite(den)) dy += 0.5 * (u - d) / den; }
+      } else { dx *= 2; dy *= 2; }
+    }
+    if (okp) pts.push(x, y, x + dx, y + dy);
+  }
+  const n = pts.length / 4;
+  if (n < 6) return null; // not enough texture to tell
+  const wgt = new Float32Array(n).fill(1), res = new Float32Array(n);
+  let m = [1, 0, 0, 0];
+  for (let it = 0; it < 4; it++) {
+    let sw = 0, mx = 0, my = 0, mu = 0, mv = 0;
+    for (let k = 0; k < n; k++) { const q = wgt[k]; sw += q; mx += q * pts[4 * k]; my += q * pts[4 * k + 1]; mu += q * pts[4 * k + 2]; mv += q * pts[4 * k + 3]; }
+    if (sw < 6) break;
+    mx /= sw; my /= sw; mu /= sw; mv /= sw;
+    let sxx = 0, sa = 0, sb = 0;
+    for (let k = 0; k < n; k++) {
+      const q = wgt[k], xs = pts[4 * k] - mx, ys = pts[4 * k + 1] - my, xd = pts[4 * k + 2] - mu, yd = pts[4 * k + 3] - mv;
+      sxx += q * (xs * xs + ys * ys); sa += q * (xs * xd + ys * yd); sb += q * (xs * yd - ys * xd);
+    }
+    let A = sxx > 0 ? sa / sxx : 1, Bv = sxx > 0 ? sb / sxx : 0;
+    // a zoom or turn far from the guess is implausible: keep the guess's zoom/turn and fit the move only
+    if (Math.abs(Math.hypot(A, Bv) / Math.hypot(guess[0], guess[1]) - 1) > 0.12 || Math.abs(Math.atan2(Bv, A) - Math.atan2(guess[1], guess[0])) > 0.12) { A = guess[0]; Bv = guess[1]; }
+    m = [A, Bv, mu - (A * mx - Bv * my), mv - (Bv * mx + A * my)];
+    // residuals -> keep only the points that agree with the fit
+    for (let k = 0; k < n; k++) {
+      const x = pts[4 * k], y = pts[4 * k + 1];
+      res[k] = Math.hypot(m[0] * x - m[1] * y + m[2] - pts[4 * k + 2], m[1] * x + m[0] * y + m[3] - pts[4 * k + 3]);
+    }
+    const sorted = Array.from(res).sort((p, q) => p - q), th = Math.max(0.8, 2.5 * sorted[n >> 1]);
+    for (let k = 0; k < n; k++) wgt[k] = res[k] <= th ? 1 : 0;
+  }
+  return m;
+}
+function compose(m2, m1) { // apply m1 first, then m2
+  return [m2[0] * m1[0] - m2[1] * m1[1], m2[1] * m1[0] + m2[0] * m1[1],
+    m2[0] * m1[2] - m2[1] * m1[3] + m2[2], m2[1] * m1[2] + m2[0] * m1[3] + m2[3]];
+}
+function inverse(m) {
+  const s2 = m[0] * m[0] + m[1] * m[1], a = m[0] / s2, b = -m[1] / s2;
+  return [a, b, -(a * m[2] - b * m[3]), -(b * m[2] + a * m[3])];
+}
+function posed(base, m) { const b = { x: base.x, y: base.y, w: base.w, h: base.h, a: base.a || 0 }; moveBox(b, m); return b; }
+function moveBox(bx, m) { // move the centre, scale the size, turn with the picture
+  const tw = W.tw, th = W.th, sc = Math.hypot(m[0], m[1]);
+  const cx = (bx.x + bx.w / 2) * tw, cy = (bx.y + bx.h / 2) * th;
+  const nx = m[0] * cx - m[1] * cy + m[2], ny = m[1] * cx + m[0] * cy + m[3];
+  bx.w *= sc; bx.h *= sc;
+  bx.x = nx / tw - bx.w / 2; bx.y = ny / th - bx.h / 2;
+  bx.a = (bx.a || 0) + Math.atan2(m[1], m[0]);
+}
+function boxCorners(b, vw, vh) {
+  const cx = (b.x + b.w / 2) * vw, cy = (b.y + b.h / 2) * vh, hw = b.w * vw / 2, hh = b.h * vh / 2;
+  const c = Math.cos(b.a || 0), s = Math.sin(b.a || 0);
+  return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => [(cx + c * x - s * y) / vw, (cy + s * x + c * y) / vh]);
 }
 
 function iou(a, b) {
@@ -798,28 +948,48 @@ function mergeBoxes(found) {
 }
 
 // ---------- detection loop ----------
-let sizeLong = 480, rate = 5, pad = 0.1;
+let sizeLong = 640, rate = 5, pad = 0.1;
 const S = { fps: 0, lastFrame: 0, detMs: 0, detHz: 0, lastDone: 0, trackMs: 0 };
+
+// The part of the video that is actually on screen (the rest is cropped by cover-fit), in 0..1 of the video,
+// with a little margin. The finder only looks there, so its pixels go to text the user can see.
+function visibleRect(vw, vh) {
+  const sa = viewW / viewH, va = vw / vh;
+  const c = va > sa ? [sa / va, 1] : [1, va / sa], m = 0.04;
+  const u0 = Math.max(0, 0.5 - c[0] / 2 - m), v0 = Math.max(0, 0.5 - c[1] / 2 - m);
+  return [u0, v0, Math.min(1, 0.5 + c[0] / 2 + m) - u0, Math.min(1, 0.5 + c[1] / 2 + m) - v0];
+}
 
 function startDetect(now) {
   busy = true; lastStart = now;
   const name = engine, seq = engineSeq;
-  const k = sizeLong / Math.max(W.vw, W.vh);
+  const [u0, v0, uw, vh] = visibleRect(W.vw, W.vh);
+  const sw = W.vw * uw, sh = W.vh * vh, k = sizeLong / Math.max(sw, sh);
   // DBNet wants sides that are multiples of 32
-  input.width = Math.max(32, Math.round(W.vw * k / 32) * 32);
-  input.height = Math.max(32, Math.round(W.vh * k / 32) * 32);
-  ig.drawImage(video, 0, 0, input.width, input.height);
-  const snap = T.cur ? T.cur.slice() : null;
+  input.width = Math.max(32, Math.round(sw * k / 32) * 32);
+  input.height = Math.max(32, Math.round(sh * k / 32) * 32);
+  ig.drawImage(source === 'test' ? testCanvas : video, u0 * W.vw, v0 * W.vh, sw, sh, 0, 0, input.width, input.height);
+  const snapPyr = T.pyr, snapFrame = T.frame;
   const t0 = performance.now();
-  finders[name].find(input).then((found) => {
+  // ?lag=ms (test only) holds each result back, to imitate a phone whose finder is slower than this PC's
+  const lag = TEST ? +params.get('lag') || 0 : 0;
+  finders[name].find(input).then((found) => lag ? new Promise((r) => setTimeout(() => r(found), lag)) : found).then((found) => {
     if (seq !== engineSeq) return;
     const t1 = performance.now();
     S.detMs = S.detMs ? S.detMs * 0.8 + (t1 - t0) * 0.2 : t1 - t0;
     if (S.lastDone) S.detHz = S.detHz ? S.detHz * 0.8 + 200 / (t1 - S.lastDone) : 1000 / (t1 - S.lastDone);
     S.lastDone = t1;
-    found = found.filter((b) => b.w > 0 && b.h > 0);
-    // the picture moved while the finder was working: carry the new boxes from that frame to now
-    if (snap && T.cur) for (const b of found) trackBox(snap, T.cur, b, 12);
+    found = found.filter((b) => b.w > 0 && b.h > 0).map((b) => ({ x: u0 + b.x * uw, y: v0 + b.y * vh, w: b.w * uw, h: b.h * vh }));
+    if (snapPyr && T.pyr && snapPyr[0].w === W.tw && snapPyr[0].h === W.th) {
+      // The picture moved while the finder was working. Measure the motion from the frame it looked at to now
+      // (starting from the frame-by-frame steps since then), and make that frame the new reference frame.
+      let g = [1, 0, 0, 0];
+      for (const hst of T.hist) if (hst.f > snapFrame) g = compose(hst.m, g);
+      const m = estimateMotion(snapPyr, T.pyr, g) || g, inv = inverse(m);
+      for (const b of boxes) b.base = posed(b, inv);
+      T.key = snapPyr; T.mk = m;
+      found = found.map((b) => ({ ...posed(b, m), base: { ...b, a: 0 } }));
+    } else found = found.map((b) => ({ ...b, a: 0, base: { ...b, a: 0 } }));
     mergeBoxes(found);
   }).catch((e) => {
     console.error(e);
@@ -835,6 +1005,8 @@ function readGray() {
   const g = new Uint8Array(W.tw * W.th);
   for (let i = 0; i < g.length; i++) g[i] = W.px[i * 4 + 3];
   T.prev = T.cur; T.cur = g; T.rgb = W.px;
+  T.ppyr = T.pyr; T.pyr = pyramid(g);
+  T.frame++;
 }
 
 // Background colour of one box: count the colours inside the text box itself (plus 1 px around it) and take
@@ -911,6 +1083,7 @@ function drawMask() {
     // the sign's own background, are the ones pulled inwards. A wide soft edge would reach past the sign.
     const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad, f = 1;
     gl.uniform4f(P.box.u.uRect, b.x * m.w - p, b.y * m.h - p, (b.x + b.w) * m.w + p, (b.y + b.h) * m.h + p);
+    gl.uniform1f(P.box.u.uAng, b.a || 0);
     gl.uniform1f(P.box.u.uFeather, f);
     gl.uniform1f(P.box.u.uAlpha, b.alpha);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -929,6 +1102,7 @@ function fillSolid() {
     if (b.alpha <= 0 || !b.col) continue;
     const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad;
     gl.uniform4f(P.solid.u.uRect, b.x * m.w - p, b.y * m.h - p, (b.x + b.w) * m.w + p, (b.y + b.h) * m.h + p);
+    gl.uniform1f(P.solid.u.uAng, b.a || 0);
     gl.uniform3f(P.solid.u.uColor, b.col[0], b.col[1], b.col[2]);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
@@ -1012,10 +1186,10 @@ function drawOverlay(cover) {
   og.setLineDash([4, 3]);
   for (const b of boxes) {
     if (b.dying) continue;
-    const [ax, ay] = toScreen(b.x, b.y), [bx, by] = toScreen(b.x + b.w, b.y + b.h);
-    const x = Math.min(ax, bx), y = Math.min(ay, by), w = Math.abs(bx - ax), h = by - ay;
-    og.lineWidth = 3; og.strokeStyle = '#fff'; og.strokeRect(x, y, w, h);
-    og.lineWidth = 1; og.strokeStyle = '#111'; og.strokeRect(x, y, w, h);
+    const q = boxCorners(b, W.vw, W.vh).map(([u, v]) => toScreen(u, v));
+    og.beginPath(); og.moveTo(q[0][0], q[0][1]); for (let k = 1; k < 4; k++) og.lineTo(q[k][0], q[k][1]); og.closePath();
+    og.lineWidth = 3; og.strokeStyle = '#fff'; og.stroke();
+    og.lineWidth = 1; og.strokeStyle = '#111'; og.stroke();
   }
   og.setLineDash([]);
 }
@@ -1027,16 +1201,27 @@ function frame(now) {
   const dt = S.lastFrame ? Math.min((now - S.lastFrame) / 1000, 0.1) : 0;
   if (dt > 0) S.fps = S.fps ? S.fps * 0.95 + 0.05 / dt : 1 / dt;
   S.lastFrame = now;
-  const live = source && video.readyState >= 2 && video.videoWidth;
+  const test = source === 'test';
+  const live = test || (source && video.readyState >= 2 && video.videoWidth);
   if (!live) { pass(null, P.show); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); return; }
-  const vw = video.videoWidth, vh = video.videoHeight;
+  if (test) drawTestScene((now - testScene.t0) / 1000);
+  const vw = test ? testCanvas.width : video.videoWidth, vh = test ? testCanvas.height : video.videoHeight;
   if (vw !== W.vw || vh !== W.vh) { allocWork(vw, vh); boxes = []; }
   gl.bindTexture(gl.TEXTURE_2D, liveTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, test ? testCanvas : video);
 
   const t0 = performance.now();
   readGray();
-  if (T.prev) for (const b of boxes) trackBox(T.prev, T.cur, b, 5);
+  // guess = last frame's step repeated (a phone keeps moving the way it was moving)
+  if (T.key) {
+    const mk = estimateMotion(T.key, T.pyr, compose(T.vel, T.mk)) || T.mk;
+    T.vel = compose(mk, inverse(T.mk)); T.mk = mk;
+    for (const b of boxes) Object.assign(b, posed(b.base, mk));
+  } else if (T.ppyr) T.vel = estimateMotion(T.ppyr, T.pyr, T.vel) || [1, 0, 0, 0];
+  if (test && T.tPrev !== undefined) motionError(T.tPrev, (now - testScene.t0) / 1000, T.vel);
+  if (test) T.tPrev = (now - testScene.t0) / 1000;
+  T.hist.push({ f: T.frame, m: T.vel });
+  if (T.hist.length > 180) T.hist.shift();
   updateColors(dt);
   S.trackMs = S.trackMs * 0.9 + (performance.now() - t0) * 0.1;
   for (let i = boxes.length - 1; i >= 0; i--) {
@@ -1046,6 +1231,7 @@ function frame(now) {
     if (b.alpha <= 0 && b.dying) boxes.splice(i, 1);
   }
   if (engine && !busy && now - lastStart >= 1000 / rate) startDetect(now);
+  if (test) scoreFrame((now - testScene.t0) / 1000);
 
   let filled = W.up[0];
   if (erase) { drawMask(); filled = fillMode === 'solid' ? fillSolid() : fillMode === 'stretch' ? fillStretch() : fillSmooth(); }
@@ -1069,7 +1255,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-if (TEST) window.__te = { S, get boxes() { return boxes; }, get engine() { return engine; }, finders, setEngine };
+if (TEST) window.__te = { S, SCORE, get boxes() { return boxes; }, get engine() { return engine; }, finders, setEngine };
 </script>
 </body>
 </html>

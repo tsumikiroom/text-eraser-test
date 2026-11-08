@@ -502,7 +502,7 @@ function allocWork(vw, vh) {
   W.tw = Math.max(8, Math.round(vw * kt)); W.th = Math.max(8, Math.round(vh * kt));
   W.gray = makeTarget(W.tw, W.th);
   W.px = new Uint8Array(W.tw * W.th * 4);
-  T.prev = null; T.cur = null; T.pyr = null; T.ppyr = null; T.key = null; T.mk = [1, 0, 0, 0]; T.vel = [1, 0, 0, 0]; T.hist = [];
+  T.prev = null; T.cur = null; T.pyr = null; T.ppyr = null; T.key = null; T.mk = [1, 0, 0, 0]; T.vel = [1, 0, 0, 0]; T.hist = []; T.lost = 0;
   W.vw = vw; W.vh = vh;
 }
 
@@ -540,11 +540,15 @@ function stopSource() {
 // Test scene (?test=1): a street-ish wall with signs, drawn straight into the frame loop instead of a camera, so
 // the true position of every text line is known for the frame being processed. ?motion=fast adds fast panning,
 // zoom and a little rotation, like a phone moved by hand.
-const MOTION = params.get('motion') === 'fast' ? 'fast' : 'slow', SCENE_SCALE = +params.get('scale') || 1; // ?scale=0.5: smaller text
+const MOTION = ['fast', 'wild'].includes(params.get('motion')) ? params.get('motion') : 'slow', SCENE_SCALE = +params.get('scale') || 1; // ?scale=0.5: smaller text
 let testScene = null;
 function sceneMatrix(t) {
   let dx, dy, sc = 1, r = 0;
-  if (MOTION === 'fast') {
+  if (MOTION === 'wild') { // rough handling: sudden jumps to another spot, shaking, quick zooms
+    dx = Math.sin(t * 1.3) * 110 + Math.sin(t * 13) * 12 + (Math.floor(t / 2.5) % 3 - 1) * 260;
+    dy = Math.cos(t * 1.1) * 55 + Math.cos(t * 11) * 10 + (Math.floor(t / 3.7) % 2) * 150;
+    sc = 1 + 0.3 * Math.sin(t * 1.7); r = 0.15 * Math.sin(t * 1.3);
+  } else if (MOTION === 'fast') {
     dx = Math.sin(t * 1.3) * 110 + Math.sin(t * 7.1) * 3; dy = Math.cos(t * 1.1) * 55 + Math.cos(t * 6.3) * 3;
     sc = 1 + 0.15 * Math.sin(t * 0.9); r = 0.06 * Math.sin(t * 0.7);
   } else {
@@ -583,6 +587,8 @@ function drawTestScene(t) {
   const sky = g.createLinearGradient(0, 0, 0, 540);
   sky.addColorStop(0, '#8fb3c9'); sky.addColorStop(1, '#c9b79c');
   g.fillStyle = sky; g.fillRect(0, 0, 960, 540);
+  // ?motion=wild: now and then the lens is covered (a flat, textureless picture) for a moment
+  if (MOTION === 'wild' && t % 6 > 5.2) { g.fillStyle = '#5a4a40'; g.fillRect(0, 0, 960, 540); return; }
   g.setTransform(...sceneMatrix(t));
   for (let y = -240; y < 780; y += 30) for (let x = -240 + (((y + 240) / 30) % 2) * 30; x < 1200; x += 60) { // brick wall
     g.fillStyle = `hsl(${18 + (((x + 240) * 7 + (y + 240) * 3) % 11)} 35% ${42 + (((x + 240) * 13 + (y + 240) * 5) % 9)}%)`;
@@ -749,7 +755,7 @@ const finders = {
           this.pending.clear();
           rej(err);
         };
-        const ep = params.get('ep') || (navigator.gpu ? 'webgpu' : 'wasm');
+        const ep = this.forceWasm ? 'wasm' : params.get('ep') || (navigator.gpu ? 'webgpu' : 'wasm');
         this.worker.postMessage({ type: 'load', ortUrl: ORT_URL, modelUrl: new URL(MODEL_URL, location.href).href, ep });
       });
     },
@@ -789,11 +795,26 @@ const finders = {
 if (!finders.native.available) { const b = document.querySelector('[data-engine=native]'); b.disabled = true; b.title = 'TextDetector is not available in this browser'; }
 
 let engine = null, engineSeq = 0, busy = false, lastStart = -1e9;
+let stallMs = 5000; // how long a find may take before the finder counts as stuck; doubles after each restart
+// The finder stopped answering (seen on phones: the GPU backend can hang, or the worker gets stopped). Throw
+// the old one away and start it again; the model then runs on the CPU (wasm), which is slower but steady.
+function restartFinder() {
+  const name = engine, f = finders[name];
+  busy = false;
+  if (f.worker && f.worker.terminate) f.worker.terminate();
+  if (f.pending) f.pending.clear();
+  f.ready = false; f.loading = null; f.forceWasm = true;
+  stallMs = Math.min(stallMs * 2, 60000); // a phone that is just slow (not stuck) gets more time, so it is not restarted forever
+  notice('The text finder stopped answering. Restarting it…', 3000);
+  setEngine(name);
+}
+
 async function setEngine(name) {
   const f = finders[name];
   if (!f || (name === 'native' && !f.available)) return;
   const seq = ++engineSeq;
   engine = null;
+  busy = false; // a find still running for the old finder is ignored from now on (its result is dropped by seq)
   for (const b of dock.querySelectorAll('[data-engine]')) b.classList.toggle('on', b.dataset.engine === name);
   S.detMs = 0; S.detHz = 0; S.lastDone = 0;
   if (!f.ready) {
@@ -813,7 +834,7 @@ for (const b of dock.querySelectorAll('[data-engine]')) b.addEventListener('clic
 // Tracking. Boxes keep a "base" pose in a reference frame (the frame the latest detection looked at) and are
 // placed each frame by the motion from that reference frame straight to the current one. Measuring from the
 // reference (not frame to frame) keeps small errors from adding up while the camera moves.
-const T = { prev: null, cur: null, rgb: null, pyr: null, ppyr: null, key: null, mk: [1, 0, 0, 0], vel: [1, 0, 0, 0], frame: 0, hist: [] };
+const T = { prev: null, cur: null, rgb: null, pyr: null, ppyr: null, key: null, mk: [1, 0, 0, 0], vel: [1, 0, 0, 0], frame: 0, hist: [], lost: 0 };
 let boxes = [];
 const FADE_IN = 0.06, FADE_OUT = 0.3, HOLD = 0.5; // HOLD: seconds a box stays fully on after the finder stops seeing it
 
@@ -912,6 +933,19 @@ function inverse(m) {
   const s2 = m[0] * m[0] + m[1] * m[1], a = m[0] / s2, b = -m[1] / s2;
   return [a, b, -(a * m[2] - b * m[3]), -(b * m[2] + a * m[3])];
 }
+// A real phone moves only so much between two frames, and only so far from the reference frame before the next
+// detection. A motion outside these limits is a bad match (blur, a covered lens, a repeating pattern); using it
+// would shrink or fling the boxes, and feeding it back as the next guess made it worse until boxes vanished.
+function plausibleStep(m) {
+  const sc = Math.hypot(m[0], m[1]);
+  return isFinite(sc) && sc > 0.92 && sc < 1.08 && Math.abs(Math.atan2(m[1], m[0])) < 0.08
+    && Math.abs(m[2]) < W.tw * 0.3 && Math.abs(m[3]) < W.th * 0.3;
+}
+function plausibleKey(m) {
+  const sc = Math.hypot(m[0], m[1]);
+  return isFinite(sc) && isFinite(m[2]) && isFinite(m[3]) && sc > 0.5 && sc < 2 && Math.abs(Math.atan2(m[1], m[0])) < 0.6
+    && Math.abs(m[2]) < W.tw * 1.5 && Math.abs(m[3]) < W.th * 1.5;
+}
 function posed(base, m) { const b = { x: base.x, y: base.y, w: base.w, h: base.h, a: base.a || 0 }; moveBox(b, m); return b; }
 function moveBox(bx, m) { // move the centre, scale the size, turn with the picture
   const tw = W.tw, th = W.th, sc = Math.hypot(m[0], m[1]);
@@ -985,16 +1019,18 @@ function startDetect(now) {
       // (starting from the frame-by-frame steps since then), and make that frame the new reference frame.
       let g = [1, 0, 0, 0];
       for (const hst of T.hist) if (hst.f > snapFrame) g = compose(hst.m, g);
-      const m = estimateMotion(snapPyr, T.pyr, g) || g, inv = inverse(m);
+      let m = estimateMotion(snapPyr, T.pyr, g);
+      if (!m || !plausibleKey(m)) m = plausibleKey(g) ? g : [1, 0, 0, 0];
+      const inv = inverse(m);
       for (const b of boxes) b.base = posed(b, inv);
-      T.key = snapPyr; T.mk = m;
+      T.key = snapPyr; T.mk = m; T.lost = 0;
       found = found.map((b) => ({ ...posed(b, m), base: { ...b, a: 0 } }));
     } else found = found.map((b) => ({ ...b, a: 0, base: { ...b, a: 0 } }));
     mergeBoxes(found);
   }).catch((e) => {
     console.error(e);
     if (seq === engineSeq) notice('Text finder error: ' + (e.message || e), 5000);
-  }).finally(() => { busy = false; });
+  }).finally(() => { if (seq === engineSeq) busy = false; });
 }
 
 function readGray() {
@@ -1214,10 +1250,19 @@ function frame(now) {
   readGray();
   // guess = last frame's step repeated (a phone keeps moving the way it was moving)
   if (T.key) {
-    const mk = estimateMotion(T.key, T.pyr, compose(T.vel, T.mk)) || T.mk;
-    T.vel = compose(mk, inverse(T.mk)); T.mk = mk;
+    let mk = estimateMotion(T.key, T.pyr, compose(T.vel, T.mk)), step = mk && compose(mk, inverse(T.mk));
+    // no texture to measure (plain wall, covered lens): just hold still. A match that makes no sense: count it as lost.
+    if (!mk) { mk = T.mk; step = [1, 0, 0, 0]; }
+    else if (!plausibleStep(step) || !plausibleKey(mk)) { mk = T.mk; step = [1, 0, 0, 0]; T.lost++; }
+    else T.lost = 0;
+    T.vel = step; T.mk = mk;
     for (const b of boxes) Object.assign(b, posed(b.base, mk));
-  } else if (T.ppyr) T.vel = estimateMotion(T.ppyr, T.pyr, T.vel) || [1, 0, 0, 0];
+    // 30 senseless matches (pointed somewhere else): let the old boxes fade, the finder brings new ones
+    if (T.lost === 30) for (const b of boxes) if (!b.dying) { b.dying = true; b.hold = 0; }
+  } else if (T.ppyr) {
+    const st = estimateMotion(T.ppyr, T.pyr, T.vel);
+    T.vel = st && plausibleStep(st) ? st : [1, 0, 0, 0];
+  }
   if (test && T.tPrev !== undefined) motionError(T.tPrev, (now - testScene.t0) / 1000, T.vel);
   if (test) T.tPrev = (now - testScene.t0) / 1000;
   T.hist.push({ f: T.frame, m: T.vel });
@@ -1231,6 +1276,7 @@ function frame(now) {
     if (b.alpha <= 0 && b.dying) boxes.splice(i, 1);
   }
   if (engine && !busy && now - lastStart >= 1000 / rate) startDetect(now);
+  if (engine && busy && now - lastStart > Math.max(stallMs, 8 * S.detMs)) restartFinder();
   if (test) scoreFrame((now - testScene.t0) / 1000);
 
   let filled = W.up[0];
@@ -1255,7 +1301,7 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-if (TEST) window.__te = { S, SCORE, get boxes() { return boxes; }, get engine() { return engine; }, finders, setEngine };
+if (TEST) window.__te = { S, SCORE, T, get boxes() { return boxes; }, get engine() { return engine; }, finders, setEngine };
 </script>
 </body>
 </html>

@@ -179,13 +179,14 @@ input[type=range]::-moz-range-thumb {
     </div>
     <div class="engine fillrow"><span>Fill</span>
       <div class="seg">
-        <button data-fill="stretch" class="on">Stretch</button>
+        <button data-fill="solid" class="on">Solid</button>
+        <button data-fill="stretch">Stretch</button>
         <button data-fill="smooth">Smooth</button>
       </div>
     </div>
     <label class="knob"><span>Size</span><input id="size" type="range" min="256" max="960" step="32" value="480" style="--tick: 4.5455%"><output id="sizeOut">480</output></label>
     <label class="knob"><span>Rate</span><input id="rate" type="range" min="1" max="15" step="1" value="5" style="--tick: 7.1429%"><output id="rateOut">5/s</output></label>
-    <label class="knob"><span>Pad</span><input id="pad" type="range" min="0" max="80" step="5" value="5" style="--tick: 6.25%"><output id="padOut">5%</output></label>
+    <label class="knob"><span>Pad</span><input id="pad" type="range" min="0" max="80" step="5" value="10" style="--tick: 6.25%"><output id="padOut">10%</output></label>
   </div>
 </div>
 
@@ -237,7 +238,16 @@ precision mediump float;
 uniform sampler2D uLive;
 in vec2 vUV;
 out vec4 o;
-void main() { o = vec4(vec3(dot(texture(uLive, vUV).rgb, vec3(0.299, 0.587, 0.114))), 1.0); }
+// Small copy of the frame for the CPU: colour in rgb (for the Solid fill), gray in alpha (for tracking).
+void main() { vec3 c = texture(uLive, vUV).rgb; o = vec4(c, dot(c, vec3(0.299, 0.587, 0.114))); }
+</script>
+<script type="x-shader/x-fragment" id="f-solid">#version 300 es
+precision mediump float;
+// Solid fill: one flat colour per text box (the sign's background colour, picked on the CPU).
+// The quad is drawn 2 px larger than the hole so the mask's anti-aliased edge never samples an empty texel.
+uniform vec3 uColor;
+out vec4 o;
+void main() { o = vec4(uColor, 1.0); }
 </script>
 <script type="x-shader/x-fragment" id="f-seed">#version 300 es
 precision mediump float;
@@ -426,6 +436,7 @@ else {
     P.up = link('v-full', 'f-up', ['uFine', 'uCoarse']);
     P.jseed = link('v-full', 'f-jseed', ['uMask']);
     P.jstep = link('v-full', 'f-jstep', ['uSrc', 'uStep']);
+    P.solid = link('v-box', 'f-solid', ['uRect', 'uFeather', 'uRes', 'uColor']);
     P.stretch = link('v-full', 'f-stretch', ['uSeeds', 'uLive']);
     P.show = link('v-screen', 'f-show', ['uLive', 'uMask', 'uFill', 'uErase', 'uCover', 'uMirror']);
   } catch (e) {
@@ -726,9 +737,9 @@ for (const b of dock.querySelectorAll('[data-engine]')) b.addEventListener('clic
 // ---------- boxes and tracking ----------
 // Boxes live in 0..1 of the video frame. Between detections they follow the picture by block matching
 // on a small gray copy of each frame.
-const T = { prev: null, cur: null };
+const T = { prev: null, cur: null, rgb: null };
 let boxes = [];
-const FADE_IN = 0.06, FADE_OUT = 0.3;
+const FADE_IN = 0.06, FADE_OUT = 0.3, HOLD = 0.5; // HOLD: seconds a box stays fully on after the finder stops seeing it
 
 function trackBox(a, b, bx, R) {
   const tw = W.tw, th = W.th;
@@ -777,16 +788,17 @@ function mergeBoxes(found) {
   const next = [], used = new Set();
   for (const nb of found) {
     let best = 0.2, match = null;
-    for (const ob of boxes) { if (used.has(ob) || ob.dying) continue; const v = iou(nb, ob); if (v > best) { best = v; match = ob; } }
+    // a box that is still fading out can be picked up again, so one missed detection does not blink the text back
+    for (const ob of boxes) { if (used.has(ob)) continue; const v = iou(nb, ob); if (v > best) { best = v; match = ob; } }
     if (match) used.add(match);
-    next.push({ ...nb, alpha: match ? match.alpha : 0, dying: false });
+    next.push({ ...nb, alpha: match ? match.alpha : 0, dying: false, col: match ? match.col : null });
   }
-  for (const ob of boxes) if (!used.has(ob)) { ob.dying = true; next.push(ob); }
+  for (const ob of boxes) if (!used.has(ob)) { if (!ob.dying) { ob.dying = true; ob.hold = HOLD; } next.push(ob); }
   boxes = next;
 }
 
 // ---------- detection loop ----------
-let sizeLong = 480, rate = 5, pad = 0.05;
+let sizeLong = 480, rate = 5, pad = 0.1;
 const S = { fps: 0, lastFrame: 0, detMs: 0, detHz: 0, lastDone: 0, trackMs: 0 };
 
 function startDetect(now) {
@@ -821,8 +833,67 @@ function readGray() {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.readPixels(0, 0, W.tw, W.th, gl.RGBA, gl.UNSIGNED_BYTE, W.px);
   const g = new Uint8Array(W.tw * W.th);
-  for (let i = 0; i < g.length; i++) g[i] = W.px[i * 4];
-  T.prev = T.cur; T.cur = g;
+  for (let i = 0; i < g.length; i++) g[i] = W.px[i * 4 + 3];
+  T.prev = T.cur; T.cur = g; T.rgb = W.px;
+}
+
+// Background colour of one box: count the colours inside the text box itself (plus 1 px around it) and take
+// the most common one. Between and around the letters is the sign's own background, which nearly always covers
+// more of the box than the letter strokes do. Looking inside (not at a ring outside) matters when the text fills
+// most of the sign: a ring outside would land on the wall. Colours are counted in a coarse 8x8x8 grid; the
+// winning cell (with its neighbours, so a colour on a cell border is not split) gives the starting estimate.
+const HIST = new Float32Array(512);
+function boxColor(b) {
+  const tw = W.tw, th = W.th, px = T.rgb;
+  const ax = Math.max(0, Math.floor(b.x * tw - 1)), ay = Math.max(0, Math.floor(b.y * th - 1));
+  const bx = Math.min(tw - 1, Math.ceil((b.x + b.w) * tw)), by = Math.min(th - 1, Math.ceil((b.y + b.h) * th));
+  HIST.fill(0);
+  const pts = [];
+  for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) {
+    const i = (y * tw + x) * 4;
+    const k = ((px[i] >> 5) << 6) | ((px[i + 1] >> 5) << 3) | (px[i + 2] >> 5);
+    HIST[k]++; pts.push(i, k);
+  }
+  if (!pts.length) return null;
+  let best = -1, bk = 0;
+  for (let k = 0; k < 512; k++) {
+    if (!HIST[k]) continue;
+    const r = k >> 6, g = (k >> 3) & 7, bl = k & 7;
+    let s = 0;
+    for (let dr = -1; dr <= 1; dr++) for (let dg = -1; dg <= 1; dg++) for (let db = -1; db <= 1; db++) {
+      const R = r + dr, G = g + dg, B = bl + db;
+      if (R < 0 || G < 0 || B < 0 || R > 7 || G > 7 || B > 7) continue;
+      s += HIST[(R << 6) | (G << 3) | B] * (dr || dg || db ? 0.5 : 1);
+    }
+    if (s > best) { best = s; bk = k; }
+  }
+  const r0 = bk >> 6, g0 = (bk >> 3) & 7, b0 = bk & 7;
+  // start from the winning cell's centre, then twice average only the pixels close to the current estimate,
+  // so shadows and wall at the ring's edge (often in a neighbouring cell) do not darken the result
+  let m = [r0 * 32 + 16, g0 * 32 + 16, b0 * 32 + 16];
+  for (const lim of [40, 20]) {
+    let sr = 0, sg = 0, sb = 0, n = 0;
+    for (let j = 0; j < pts.length; j += 2) {
+      const i = pts[j], dr = px[i] - m[0], dg = px[i + 1] - m[1], db = px[i + 2] - m[2];
+      if (dr * dr + dg * dg + db * db > lim * lim) continue;
+      sr += px[i]; sg += px[i + 1]; sb += px[i + 2]; n++;
+    }
+    if (!n) break;
+    m = [sr / n, sg / n, sb / n];
+  }
+  return [m[0] / 255, m[1] / 255, m[2] / 255];
+}
+
+// Update each live box's colour, smoothed over time so it does not flicker as the camera noise changes.
+function updateColors(dt) {
+  const a = 1 - Math.exp(-dt / 0.15);
+  for (const b of boxes) {
+    if (b.dying && b.col) continue; // keep the last colour while it fades out
+    const c = boxColor(b);
+    if (!c) continue;
+    if (!b.col) b.col = c;
+    else for (let i = 0; i < 3; i++) b.col[i] += (c[i] - b.col[i]) * a;
+  }
 }
 
 // ---------- erase: mask + push-pull fill ----------
@@ -835,7 +906,7 @@ function drawMask() {
   gl.blendEquation(gl.MAX);
   gl.uniform2f(P.box.u.uRes, m.w, m.h);
   for (const b of boxes) {
-    if (b.alpha <= 0) continue;
+    if (b.alpha <= 0 || !b.col) continue; // no colour yet = box entirely off the frame: nothing to cover
     // Hard edge (1 px anti-alias): the hole is just the padded text box, so the pixels right outside it,
     // the sign's own background, are the ones pulled inwards. A wide soft edge would reach past the sign.
     const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad, f = 1;
@@ -846,6 +917,22 @@ function drawMask() {
   }
   gl.disable(gl.BLEND);
   gl.blendEquation(gl.FUNC_ADD);
+}
+
+// Solid: each box covered with its own flat background colour.
+function fillSolid() {
+  const m = W.out;
+  pass(m, P.solid);
+  gl.uniform2f(P.solid.u.uRes, m.w, m.h);
+  gl.uniform1f(P.solid.u.uFeather, 2);
+  for (const b of boxes) {
+    if (b.alpha <= 0 || !b.col) continue;
+    const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad;
+    gl.uniform4f(P.solid.u.uRect, b.x * m.w - p, b.y * m.h - p, (b.x + b.w) * m.w + p, (b.y + b.h) * m.h + p);
+    gl.uniform3f(P.solid.u.uColor, b.col[0], b.col[1], b.col[2]);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  return m;
 }
 
 // Stretch: jump flooding finds, for each hole pixel, the nearest pixel outside the hole.
@@ -896,7 +983,7 @@ function fillSmooth() {
 }
 
 // ---------- UI ----------
-let erase = true, showBoxes = false, fillMode = params.get('fill') === 'smooth' ? 'smooth' : 'stretch';
+let erase = true, showBoxes = false, fillMode = ['stretch', 'smooth'].includes(params.get('fill')) ? params.get('fill') : 'solid';
 for (const b of dock.querySelectorAll('[data-fill]')) {
   b.classList.toggle('on', b.dataset.fill === fillMode);
   b.addEventListener('click', () => { fillMode = b.dataset.fill; for (const c of dock.querySelectorAll('[data-fill]')) c.classList.toggle('on', c === b); });
@@ -950,16 +1037,18 @@ function frame(now) {
   const t0 = performance.now();
   readGray();
   if (T.prev) for (const b of boxes) trackBox(T.prev, T.cur, b, 5);
+  updateColors(dt);
   S.trackMs = S.trackMs * 0.9 + (performance.now() - t0) * 0.1;
   for (let i = boxes.length - 1; i >= 0; i--) {
     const b = boxes[i];
-    b.alpha = b.dying ? b.alpha - dt / FADE_OUT : Math.min(1, b.alpha + dt / FADE_IN);
+    if (b.dying && b.hold > 0) b.hold -= dt;
+    else b.alpha = b.dying ? b.alpha - dt / FADE_OUT : Math.min(1, b.alpha + dt / FADE_IN);
     if (b.alpha <= 0 && b.dying) boxes.splice(i, 1);
   }
   if (engine && !busy && now - lastStart >= 1000 / rate) startDetect(now);
 
   let filled = W.up[0];
-  if (erase) { drawMask(); filled = fillMode === 'stretch' ? fillStretch() : fillSmooth(); }
+  if (erase) { drawMask(); filled = fillMode === 'solid' ? fillSolid() : fillMode === 'stretch' ? fillStretch() : fillSmooth(); }
   const sa = viewW / viewH, va = vw / vh;
   const cover = va > sa ? [sa / va, 1] : [1, va / sa];
   pass(null, P.show);

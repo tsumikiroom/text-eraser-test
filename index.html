@@ -1,0 +1,986 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Text Eraser</title>
+<link rel="icon" href="data:,">
+<style>
+/* Line-drawing UI (same family as pixel-stretch-touch): white paper, 1px black lines, capsules, bold grotesque */
+:root { --ink: #111; --paper: #fff; --line: 1px solid var(--ink); }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+  background: #000; color: var(--ink); touch-action: none;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  font: 500 15px/1.3 "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif; letter-spacing: -.01em;
+}
+#stage, #over { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+#over { pointer-events: none; }
+#cam { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+
+button {
+  font: inherit; color: var(--ink); background: var(--paper); cursor: pointer; touch-action: manipulation;
+  border: var(--line); border-radius: 999px; min-height: 44px; padding: 0 14px;
+}
+button.on { background: var(--ink); color: var(--paper); }
+button:disabled { color: #aaa; cursor: default; }
+.small { font-size: 12px; font-weight: 700; }
+
+/* ---- start sheet ---- */
+#start {
+  position: fixed; inset: 0; overflow-y: auto; touch-action: pan-y; background: var(--paper);
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
+}
+#start.hide { display: none; }
+.sheet {
+  min-height: 100%; display: flex; flex-direction: column; gap: 18px;
+  border: var(--line); border-radius: 22px; padding: 16px 18px 18px;
+}
+.meta { display: flex; justify-content: space-between; gap: 12px; }
+.sheet h1 { margin: auto 0 0; font-size: 60px; line-height: .88; font-weight: 700; letter-spacing: -.045em; }
+.diagram { display: block; width: 100%; height: auto; overflow: visible; }
+.diagram text { font: 700 11px "Helvetica Neue", Helvetica, Arial, sans-serif; fill: var(--ink); }
+.sheet p { margin: 0; max-width: 30em; }
+.choose { display: grid; gap: 8px; }
+.choose button {
+  min-height: 60px; padding: 0 22px; display: flex; justify-content: space-between; align-items: center;
+  font-size: 18px; font-weight: 700; letter-spacing: -.02em;
+}
+.choose button:active { background: var(--ink); color: var(--paper); }
+.choose .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.choose .row button { min-height: 48px; font-size: 15px; padding: 0 16px; }
+#file { display: none; }
+#err { display: none; padding: 12px 14px; border: 1px dashed var(--ink); border-radius: 14px; white-space: pre-line; }
+#err::before { content: "Error"; display: block; margin-bottom: 4px; font-size: 12px; font-weight: 700; }
+#err.show { display: block; }
+.sheet .foot { margin-top: auto; padding-top: 12px; border-top: 1px dashed var(--ink); }
+
+/* ---- messages over the video ---- */
+#hint, #stats {
+  position: fixed; background: var(--paper); border: var(--line); pointer-events: none;
+}
+#hint {
+  left: 50%; top: calc(env(safe-area-inset-top, 0px) + 14px); transform: translateX(-50%);
+  width: max-content; max-width: calc(100% - 32px); padding: 8px 16px; border-radius: 18px;
+  font-size: 14px; font-weight: 700; text-align: center; white-space: pre-line; transition: opacity .6s;
+}
+#hint:empty, #stats:empty { display: none; }
+#stats {
+  left: max(8px, env(safe-area-inset-left, 0px)); top: calc(env(safe-area-inset-top, 0px) + 62px);
+  padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+
+/* ---- control card ---- */
+#dock {
+  position: fixed; display: none; padding: 8px;
+  left: max(8px, env(safe-area-inset-left, 0px)); right: max(8px, env(safe-area-inset-right, 0px));
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+  background: var(--paper); border: var(--line); border-radius: 22px;
+}
+#dock.show { display: block; }
+.bar { display: flex; gap: 6px; align-items: center; }
+.bar button { flex: 1; padding: 0 6px; font-size: 14px; font-weight: 700; }
+.seg { flex: 2; display: flex; border: var(--line); border-radius: 999px; overflow: hidden; }
+.seg button { flex: 1; border: 0; border-radius: 0; min-height: 42px; font-size: 14px; font-weight: 700; padding: 0 6px; }
+.seg button + button { border-left: var(--line); }
+#fold { flex: 0 0 44px; padding: 0; display: grid; place-items: center; }
+#fold svg { transition: transform .2s; }
+#dock.folded #fold svg { transform: rotate(180deg); }
+.knobs { margin-top: 8px; padding: 0 6px; border-top: 1px solid var(--ink); }
+#dock.folded .knobs { display: none; }
+.knobs .fillrow { border-top: 1px solid var(--ink); }
+.knobs .engine { display: grid; grid-template-columns: 4.2em 1fr; gap: 10px; align-items: center; min-height: 52px; font-weight: 700; }
+label.knob {
+  display: grid; grid-template-columns: 4.2em 1fr 3.2em; gap: 10px; align-items: center; min-height: 44px;
+  font-size: 15px; font-weight: 700; letter-spacing: -.01em; border-top: 1px solid var(--ink);
+}
+label.knob output { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* slider = a hairline ruler with tick marks and a ringed dot */
+input[type=range] {
+  --tick: 10%;
+  -webkit-appearance: none; appearance: none; width: 100%; height: 44px; margin: 0; background:
+    linear-gradient(var(--ink), var(--ink)) center / calc(100% - 16px) 1px no-repeat,
+    repeating-linear-gradient(90deg, var(--ink) 0 1px, transparent 1px var(--tick)) center / calc(100% - 16px) 7px no-repeat,
+    linear-gradient(var(--ink), var(--ink)) right 8px center / 1px 7px no-repeat;
+}
+input[type=range]:focus { outline: none; }
+input[type=range]::-webkit-slider-runnable-track { height: 44px; background: transparent; }
+input[type=range]::-moz-range-track { height: 44px; background: transparent; }
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px; margin-top: 14px; border-radius: 50%;
+  background: var(--ink); border: var(--line); box-shadow: inset 0 0 0 3px var(--paper);
+}
+input[type=range]::-moz-range-thumb {
+  width: 16px; height: 16px; border-radius: 50%; box-sizing: border-box;
+  background: var(--ink); border: var(--line); box-shadow: inset 0 0 0 3px var(--paper);
+}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<canvas id="over"></canvas>
+<video id="cam" playsinline muted autoplay loop></video>
+<div id="hint"></div>
+<div id="stats"></div>
+
+<div id="start">
+  <div class="sheet">
+    <div class="meta small"><span>No. 2</span><span>Detect / Fill / Camera</span></div>
+    <h1>Text<br>Eraser.</h1>
+    <svg class="diagram" viewBox="0 0 320 130" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1">
+      <!-- a sign with lines of text, then the same sign with only the empty boxes left -->
+      <rect x="14" y="24" width="120" height="76" rx="10" />
+      <path d="M30 46 h88 M30 62 h70 M30 78 h80" stroke-width="5" />
+      <path d="M150 62 h30 M174 56 l6 6 -6 6" />
+      <rect x="194" y="24" width="120" height="76" rx="10" />
+      <rect x="26" y="40" width="96" height="12" rx="6" stroke-dasharray="3 3" transform="translate(180 0)" />
+      <rect x="26" y="56" width="78" height="12" rx="6" stroke-dasharray="3 3" transform="translate(180 0)" />
+      <rect x="26" y="72" width="88" height="12" rx="6" stroke-dasharray="3 3" transform="translate(180 0)" />
+      <text x="74" y="118" text-anchor="middle" stroke="none">find</text>
+      <text x="254" y="118" text-anchor="middle" stroke="none">fill from around</text>
+      <text x="74" y="14" text-anchor="middle" stroke="none">text</text>
+      <text x="254" y="14" text-anchor="middle" stroke="none">gone</text>
+    </svg>
+    <p>Point the camera at signs, labels or pages. Any text it finds is wiped away on the spot and filled in from the colours around it. Nothing is read or translated.</p>
+    <div class="choose">
+      <button data-facing="environment"><span>Back camera</span><span aria-hidden="true">&rarr;</span></button>
+      <div class="row">
+        <button data-facing="user">Front camera</button>
+        <button id="pick">Video file</button>
+      </div>
+      <button id="testBtn" hidden><span>Test scene</span><span aria-hidden="true">&rarr;</span></button>
+      <input id="file" type="file" accept="video/*">
+    </div>
+    <div id="err"></div>
+    <div class="meta small foot"><span>Video stays on this device</span><span>HTTPS</span></div>
+  </div>
+</div>
+
+<div id="dock">
+  <div class="bar">
+    <div class="seg">
+      <button data-facing="user">Front</button>
+      <button data-facing="environment">Back</button>
+    </div>
+    <button id="erase" class="on" aria-pressed="true">Erase</button>
+    <button id="boxes" aria-pressed="false">Boxes</button>
+    <button id="fold" aria-label="Hide controls" aria-expanded="true"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3 6l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
+  </div>
+  <div class="knobs">
+    <div class="engine"><span>Finder</span>
+      <div class="seg">
+        <button data-engine="paddle">Paddle</button>
+        <button data-engine="native">Native</button>
+        <button data-engine="tess">Tess</button>
+      </div>
+    </div>
+    <div class="engine fillrow"><span>Fill</span>
+      <div class="seg">
+        <button data-fill="stretch" class="on">Stretch</button>
+        <button data-fill="smooth">Smooth</button>
+      </div>
+    </div>
+    <label class="knob"><span>Size</span><input id="size" type="range" min="256" max="960" step="32" value="480" style="--tick: 4.5455%"><output id="sizeOut">480</output></label>
+    <label class="knob"><span>Rate</span><input id="rate" type="range" min="1" max="15" step="1" value="5" style="--tick: 7.1429%"><output id="rateOut">5/s</output></label>
+    <label class="knob"><span>Pad</span><input id="pad" type="range" min="0" max="80" step="5" value="5" style="--tick: 6.25%"><output id="padOut">5%</output></label>
+  </div>
+</div>
+
+<script type="x-shader/x-vertex" id="v-full">#version 300 es
+// Full-frame pass in video texture space: v = 0 is the top row of the video.
+in vec2 aPos;
+out vec2 vUV;
+void main() { vUV = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+<script type="x-shader/x-vertex" id="v-screen">#version 300 es
+// Screen pass: cover-fit the video, mirror for the front camera.
+in vec2 aPos;
+uniform vec2 uCover;
+uniform float uMirror;
+out vec2 vUV;
+void main() {
+  vec2 s = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+  vUV = (s - 0.5) * uCover + 0.5;
+  if (uMirror > 0.5) vUV.x = 1.0 - vUV.x;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+</script>
+<script type="x-shader/x-vertex" id="v-box">#version 300 es
+// One text box drawn into the mask: unit quad stretched to the box plus its soft edge (pixels of the mask).
+in vec2 aPos;
+uniform vec4 uRect;     // inner rect x0, y0, x1, y1 (already padded)
+uniform float uFeather;
+uniform vec2 uRes;
+out vec2 vPx;
+void main() {
+  vPx = mix(uRect.xy - uFeather, uRect.zw + uFeather, aPos * 0.5 + 0.5);
+  gl_Position = vec4(vPx / uRes * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-box">#version 300 es
+precision highp float;
+uniform vec4 uRect;
+uniform float uFeather;
+uniform float uAlpha;
+in vec2 vPx;
+out vec4 o;
+void main() {
+  float d = length(max(max(uRect.xy - vPx, vPx - uRect.zw), 0.0));
+  o = vec4((1.0 - smoothstep(0.0, uFeather, d)) * uAlpha);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-gray">#version 300 es
+precision mediump float;
+uniform sampler2D uLive;
+in vec2 vUV;
+out vec4 o;
+void main() { o = vec4(vec3(dot(texture(uLive, vUV).rgb, vec3(0.299, 0.587, 0.114))), 1.0); }
+</script>
+<script type="x-shader/x-fragment" id="f-seed">#version 300 es
+precision mediump float;
+// Pyramid level 0: the live picture, with weight 0 wherever the mask touches (the hole to fill).
+uniform sampler2D uLive;
+uniform sampler2D uMask;
+in vec2 vUV;
+out vec4 o;
+void main() { o = vec4(texture(uLive, vUV).rgb, texture(uMask, vUV).r > 0.004 ? 0.0 : 1.0); }
+</script>
+<script type="x-shader/x-fragment" id="f-down">#version 300 es
+precision mediump float;
+// Push: average 2x2 texels, counting only the ones outside the hole.
+uniform sampler2D uSrc;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) * 2;
+  ivec2 m = textureSize(uSrc, 0) - 1;
+  vec4 s = vec4(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec4 t = texelFetch(uSrc, min(p + ivec2(i & 1, i >> 1), m), 0);
+    s += vec4(t.rgb * t.a, t.a);
+  }
+  o = s.a > 0.0 ? vec4(s.rgb / s.a, min(s.a, 1.0)) : vec4(0.0);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-up">#version 300 es
+precision mediump float;
+// Pull: keep known texels, fill the rest from the (already filled) coarser level.
+uniform sampler2D uFine;
+uniform sampler2D uCoarse;
+out vec4 o;
+void main() {
+  vec4 f = texelFetch(uFine, ivec2(gl_FragCoord.xy), 0);
+  vec3 c = texture(uCoarse, gl_FragCoord.xy / vec2(textureSize(uFine, 0))).rgb;
+  o = vec4(mix(c, f.rgb, f.a), 1.0);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-jseed">#version 300 es
+precision highp float;
+// Stretch fill, step 1: every pixel outside the hole is its own seed. Coordinates packed into RGBA8 (16 bits each).
+uniform sampler2D uMask;
+in vec2 vUV;
+out vec4 o;
+vec4 pack(vec2 p) { return vec4(floor(p.x / 256.0), mod(p.x, 256.0), floor(p.y / 256.0), mod(p.y, 256.0)) / 255.0; }
+void main() {
+  vec2 p = floor(gl_FragCoord.xy);
+  o = texture(uMask, vUV).r > 0.004 ? vec4(1.0) : pack(p);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-jstep">#version 300 es
+precision highp float;
+// Jump flooding: look at 9 pixels uStep apart and keep the nearest seed.
+uniform sampler2D uSrc;
+uniform float uStep;
+out vec4 o;
+vec2 unpack(vec4 v) { v = floor(v * 255.0 + 0.5); return vec2(v.r * 256.0 + v.g, v.b * 256.0 + v.a); }
+void main() {
+  ivec2 sz = textureSize(uSrc, 0);
+  vec2 p = floor(gl_FragCoord.xy);
+  float best = 1e20; vec4 bv = vec4(1.0);
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    ivec2 q = ivec2(p) + ivec2(i, j) * int(uStep);
+    if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) continue;
+    vec4 v = texelFetch(uSrc, q, 0);
+    if (v.r > 0.99 && v.b > 0.99) continue; // empty
+    vec2 d = unpack(v) - p;
+    float dd = dot(d, d);
+    if (dd < best) { best = dd; bv = v; }
+  }
+  o = bv;
+}
+</script>
+<script type="x-shader/x-fragment" id="f-stretch">#version 300 es
+precision highp float;
+// Stretch fill, last step: gather the colours of the nearest pixels outside the hole (the rim right next to
+// the text, i.e. the sign's own background), from this pixel and from 16 neighbours that sit further away the
+// deeper we are inside. Then keep the majority colour: samples far from the running average lose weight,
+// so a bit of wall or shadow at the sign's edge does not tint a black sign brown.
+uniform sampler2D uSeeds;
+uniform sampler2D uLive;
+out vec4 o;
+vec2 unpack(vec4 v) { v = floor(v * 255.0 + 0.5); return vec2(v.r * 256.0 + v.g, v.b * 256.0 + v.a); }
+void main() {
+  ivec2 sz = textureSize(uSeeds, 0);
+  vec2 res = vec2(sz);
+  vec2 p = floor(gl_FragCoord.xy);
+  vec4 v0 = texelFetch(uSeeds, ivec2(p), 0);
+  if (v0.r > 0.99 && v0.b > 0.99) { o = vec4(texture(uLive, (p + 0.5) / res).rgb, 1.0); return; }
+  vec2 s0 = unpack(v0);
+  float r = 0.8 * length(s0 - p);
+  vec3 cs[17];
+  cs[0] = texture(uLive, (s0 + 0.5) / res).rgb;
+  for (int i = 0; i < 16; i++) {
+    float a = float(i) * 0.392699 + 0.2;
+    float rr = r * (i % 2 == 0 ? 1.0 : 0.5);
+    ivec2 q = clamp(ivec2(p + rr * vec2(cos(a), sin(a))), ivec2(0), sz - 1);
+    vec4 v = texelFetch(uSeeds, q, 0);
+    cs[i + 1] = (v.r > 0.99 && v.b > 0.99) ? cs[0] : texture(uLive, (unpack(v) + 0.5) / res).rgb;
+  }
+  vec3 m = vec3(0.0);
+  for (int i = 0; i < 17; i++) m += cs[i];
+  m /= 17.0;
+  for (int k = 0; k < 3; k++) {
+    vec3 acc = vec3(0.0); float wsum = 0.0;
+    for (int i = 0; i < 17; i++) {
+      vec3 d = cs[i] - m;
+      float w = exp(-dot(d, d) * 40.0) + (i == 0 ? 0.05 : 0.0);
+      acc += cs[i] * w; wsum += w;
+    }
+    m = acc / wsum;
+  }
+  o = vec4(m, 1.0);
+}
+</script>
+<script type="x-shader/x-fragment" id="f-show">#version 300 es
+precision mediump float;
+uniform sampler2D uLive;
+uniform sampler2D uMask;
+uniform sampler2D uFill;
+uniform float uErase;
+in vec2 vUV;
+out vec4 o;
+void main() {
+  vec3 c = texture(uLive, vUV).rgb;
+  if (uErase > 0.5) c = mix(c, texture(uFill, vUV).rgb, texture(uMask, vUV).r);
+  o = vec4(c, 1.0);
+}
+</script>
+
+<script>
+'use strict';
+const params = new URLSearchParams(location.search);
+const TEST = params.has('test');
+const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+const TESS_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+const MODEL_URL = 'models/ppocrv4_det.onnx';   // PaddleOCR PP-OCRv4 text detector (DBNet), finds text regions only
+
+const $ = (id) => document.getElementById(id);
+const cv = $('stage'), over = $('over'), og = over.getContext('2d');
+const video = $('cam'), startEl = $('start'), errEl = $('err'), dock = $('dock'), hint = $('hint'), statsEl = $('stats');
+if (TEST) $('testBtn').hidden = false;
+
+function showError(text) {
+  startEl.classList.remove('hide');
+  dock.classList.remove('show');
+  errEl.textContent = text;
+  errEl.classList.add('show');
+}
+function notice(text, ms = 4000) {
+  hint.textContent = text;
+  hint.style.opacity = 1;
+  clearTimeout(notice.t);
+  if (ms) notice.t = setTimeout(() => { hint.style.opacity = 0; }, ms);
+}
+
+// ---------- WebGL2 ----------
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: TEST });
+const P = {};
+let ok = !!gl;
+if (!gl) showError('This browser does not support WebGL2, so the page cannot be shown.');
+else {
+  const compile = (type, id) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, $(id).textContent.trim());
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(id + ': ' + gl.getShaderInfoLog(sh));
+    return sh;
+  };
+  const link = (vs, fs, uniforms) => {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'aPos');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {};
+    for (const k of uniforms) u[k] = gl.getUniformLocation(p, k);
+    return { p, u };
+  };
+  try {
+    P.gray = link('v-full', 'f-gray', ['uLive']);
+    P.box = link('v-box', 'f-box', ['uRect', 'uFeather', 'uAlpha', 'uRes']);
+    P.seed = link('v-full', 'f-seed', ['uLive', 'uMask']);
+    P.down = link('v-full', 'f-down', ['uSrc']);
+    P.up = link('v-full', 'f-up', ['uFine', 'uCoarse']);
+    P.jseed = link('v-full', 'f-jseed', ['uMask']);
+    P.jstep = link('v-full', 'f-jstep', ['uSrc', 'uStep']);
+    P.stretch = link('v-full', 'f-stretch', ['uSeeds', 'uLive']);
+    P.show = link('v-screen', 'f-show', ['uLive', 'uMask', 'uFill', 'uErase', 'uCover', 'uMirror']);
+  } catch (e) {
+    console.error(e);
+    ok = false;
+    showError('The renderer (shader) could not be prepared. Try opening this page in another browser.');
+  }
+}
+
+function makeTex(w, h, filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  return t;
+}
+function makeTarget(w, h, filter = gl.LINEAR) {
+  const tex = makeTex(w, h, filter), fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, w, h };
+}
+function freeTarget(t) { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); } }
+
+let liveTex = null;
+if (ok) {
+  gl.bindVertexArray(gl.createVertexArray());
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  liveTex = makeTex(1, 1, gl.LINEAR);
+}
+
+// Work buffers, sized from the video: mask + fill pyramid (WORK px long side) and a small gray copy for tracking.
+const WORK = 480, TRACK = 240;
+const W = { vw: 0, vh: 0, mask: null, down: [], up: [], jfa: [], out: null, gray: null, tw: 0, th: 0, px: null };
+function allocWork(vw, vh) {
+  freeTarget(W.mask); freeTarget(W.gray); freeTarget(W.out);
+  for (const t of W.jfa) freeTarget(t);
+  for (const t of W.down) freeTarget(t);
+  for (const t of W.up) freeTarget(t);
+  const k = Math.min(1, WORK / Math.max(vw, vh));
+  let w = Math.max(2, Math.round(vw * k)), h = Math.max(2, Math.round(vh * k));
+  W.mask = makeTarget(w, h);
+  W.jfa = [makeTarget(w, h, gl.NEAREST), makeTarget(w, h, gl.NEAREST)];
+  W.out = makeTarget(w, h);
+  W.down = []; W.up = [];
+  for (;;) {
+    W.down.push(makeTarget(w, h));
+    W.up.push(makeTarget(w, h));
+    if (w <= 1 && h <= 1) break;
+    w = Math.max(1, Math.ceil(w / 2)); h = Math.max(1, Math.ceil(h / 2));
+  }
+  const kt = TRACK / Math.max(vw, vh);
+  W.tw = Math.max(8, Math.round(vw * kt)); W.th = Math.max(8, Math.round(vh * kt));
+  W.gray = makeTarget(W.tw, W.th);
+  W.px = new Uint8Array(W.tw * W.th * 4);
+  T.prev = null; T.cur = null;
+  W.vw = vw; W.vh = vh;
+}
+
+function pass(target, prog) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+  if (target) gl.viewport(0, 0, target.w, target.h);
+  else gl.viewport(0, 0, cv.width, cv.height);
+  gl.useProgram(prog.p);
+}
+function bindTex(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
+
+let viewW = 1, viewH = 1;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  viewW = window.innerWidth; viewH = window.innerHeight;
+  cv.width = over.width = Math.round(viewW * dpr);
+  cv.height = over.height = Math.round(viewH * dpr);
+  og.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- sources: camera / video file / test scene ----------
+let stream = null, mirror = false, facing = null, source = null, testCanvas = null, fileURL = null;
+let openSeq = 0;
+
+function stopSource() {
+  if (stream) for (const t of stream.getTracks()) t.stop();
+  stream = null;
+  if (fileURL) { URL.revokeObjectURL(fileURL); fileURL = null; }
+  video.removeAttribute('src');
+  video.srcObject = null;
+}
+
+function makeTestStream() {
+  // A slowly drifting street-ish scene with signs, used instead of a camera (?test=1)
+  if (!testCanvas) {
+    testCanvas = document.createElement('canvas');
+    testCanvas.width = 960; testCanvas.height = 540;
+    const g = testCanvas.getContext('2d');
+    const t0 = performance.now();
+    const signs = [
+      { x: 60, y: 60, w: 330, h: 120, bg: '#f4f1e8', fg: '#1a1a1a', lines: ['OPEN DAILY', '10:00 - 20:00'], font: 'bold 40px sans-serif' },
+      { x: 520, y: 40, w: 360, h: 90, bg: '#1d3b2a', fg: '#ffffff', lines: ['出口 EXIT →'], font: 'bold 50px sans-serif' },
+      { x: 480, y: 210, w: 380, h: 170, bg: '#d94f30', fg: '#fff7e0', lines: ['SALE', 'up to 50% off'], font: 'bold 54px serif' },
+      { x: 90, y: 260, w: 300, h: 200, bg: '#fafafa', fg: '#333', lines: ['Lorem ipsum dolor', 'sit amet, consectetur', 'adipiscing elit. 本日', 'のおすすめ'], font: '26px sans-serif' },
+    ];
+    const draw = () => {
+      const t = (performance.now() - t0) / 1000;
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      const sky = g.createLinearGradient(0, 0, 0, 540);
+      sky.addColorStop(0, '#8fb3c9'); sky.addColorStop(1, '#c9b79c');
+      g.fillStyle = sky; g.fillRect(0, 0, 960, 540);
+      // drift + small jitter like a handheld phone
+      const dx = Math.sin(t * 0.4) * 40 + Math.sin(t * 7.1) * 1.5, dy = Math.cos(t * 0.3) * 20 + Math.cos(t * 6.3) * 1.5;
+      g.setTransform(1, 0, 0, 1, dx, dy);
+      for (let y = -60; y < 600; y += 30) for (let x = -60 + ((y / 30) % 2) * 30; x < 1020; x += 60) { // brick wall
+        g.fillStyle = `hsl(${18 + ((x * 7 + y * 3) % 11)} 35% ${42 + ((x * 13 + y * 5) % 9)}%)`;
+        g.fillRect(x, y, 58, 28);
+      }
+      for (const s of signs) {
+        g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(s.x + 6, s.y + 6, s.w, s.h);
+        g.fillStyle = s.bg; g.fillRect(s.x, s.y, s.w, s.h);
+        g.fillStyle = s.fg; g.font = s.font; g.textBaseline = 'middle';
+        const lh = s.h / (s.lines.length + 0.6);
+        s.lines.forEach((l, i) => g.fillText(l, s.x + 20, s.y + lh * (i + 0.8)));
+      }
+      requestAnimationFrame(draw);
+    };
+    draw();
+  }
+  return testCanvas.captureStream(30);
+}
+
+function explain(e) {
+  const n = e && e.name;
+  if (n === 'NotAllowedError' || n === 'SecurityError') return 'Camera access was not allowed. Allow the camera for this page in your browser settings, then tap a button again.';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'This camera was not found. Try the other one.';
+  if (n === 'NotReadableError' || n === 'AbortError') return 'The camera could not be opened. Check that no other app is using it.';
+  return 'The video could not be opened (' + (n || 'error') + ').';
+}
+
+function started(kind) {
+  source = kind;
+  startEl.classList.add('hide');
+  dock.classList.add('show');
+  for (const b of dock.querySelectorAll('[data-facing]')) b.classList.toggle('on', kind === 'camera' && b.dataset.facing === facing);
+  if (!engine) setEngine('paddle');
+}
+
+// Called straight from a click handler so iOS treats it as a user action.
+function openCamera(want, fallback) {
+  if (!ok) return;
+  const seq = ++openSeq;
+  errEl.classList.remove('show');
+  let req;
+  if (want === 'test') {
+    stopSource();
+    req = Promise.resolve(makeTestStream());
+  } else {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showError('The camera only works on HTTPS pages. Reopen this page from an https:// address.');
+      return;
+    }
+    stopSource(); // release the old camera first (iOS cannot hold two)
+    req = navigator.mediaDevices.getUserMedia({ video: { facingMode: want, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  }
+  req.then((s) => {
+    if (seq !== openSeq) { if (want !== 'test') for (const t of s.getTracks()) t.stop(); throw { stale: true }; }
+    stream = s;
+    facing = want === 'test' ? null : want;
+    mirror = want === 'user';
+    video.srcObject = s;
+    return video.play();
+  }).then(() => {
+    if (seq !== openSeq) return;
+    started(want === 'test' ? 'test' : 'camera');
+  }).catch((e) => {
+    if ((e && e.stale) || seq !== openSeq) return;
+    stopSource();
+    if (fallback && fallback !== want) { notice(explain(e) + '\nSwitching back to the previous camera.'); openCamera(fallback); return; }
+    showError(explain(e));
+  });
+}
+for (const b of document.querySelectorAll('[data-facing]')) b.addEventListener('click', () => openCamera(b.dataset.facing, facing));
+$('testBtn').addEventListener('click', () => openCamera('test'));
+$('pick').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  ++openSeq;
+  stopSource();
+  facing = null; mirror = false;
+  fileURL = URL.createObjectURL(f);
+  video.src = fileURL;
+  video.play().then(() => started('file')).catch((e) => showError(explain(e)));
+  ev.target.value = '';
+});
+
+// ---------- text finders ----------
+// Each finder takes a canvas and returns boxes in 0..1 of the frame: [{x, y, w, h}], top-left origin.
+const input = document.createElement('canvas');
+const ig = input.getContext('2d', { willReadFrequently: true });
+
+function loadScript(url) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = url; s.crossOrigin = 'anonymous';
+    s.onload = res; s.onerror = () => rej(new Error('could not load ' + url));
+    document.head.appendChild(s);
+  });
+}
+
+const finders = {
+  paddle: {
+    backend: '',
+    // The model runs in finder-worker.js; the page only sends pixels and gets boxes back.
+    load() {
+      return new Promise((res, rej) => {
+        this.worker = new Worker('finder-worker.js');
+        this.pending = new Map(); this.nextId = 1;
+        this.worker.onmessage = (ev) => {
+          const m = ev.data;
+          if (m.type === 'ready') { this.backend = m.backend; res(); return; }
+          const job = this.pending.get(m.id);
+          if (m.type === 'error' && !job) { rej(new Error('The text finder model could not start. ' + m.message)); return; }
+          if (!job) return;
+          this.pending.delete(m.id);
+          if (m.type === 'boxes') job.res(m.boxes); else job.rej(new Error(m.message));
+        };
+        this.worker.onerror = (e) => {
+          const err = new Error(e.message || 'worker error');
+          for (const job of this.pending.values()) job.rej(err); // unblock waiting finds so detection can retry
+          this.pending.clear();
+          rej(err);
+        };
+        const ep = params.get('ep') || (navigator.gpu ? 'webgpu' : 'wasm');
+        this.worker.postMessage({ type: 'load', ortUrl: ORT_URL, modelUrl: new URL(MODEL_URL, location.href).href, ep });
+      });
+    },
+    find(c) {
+      const img = ig.getImageData(0, 0, c.width, c.height);
+      const id = this.nextId++;
+      return new Promise((res, rej) => {
+        this.pending.set(id, { res, rej });
+        this.worker.postMessage({ type: 'find', id, w: c.width, h: c.height, px: img.data.buffer }, [img.data.buffer]);
+      });
+    },
+  },
+  native: {
+    backend: 'TextDetector',
+    available: 'TextDetector' in window,
+    async load() { this.det = new TextDetector(); },
+    async find(c) {
+      const res = await this.det.detect(c);
+      return res.map((r) => { const b = r.boundingBox; return { x: b.x / c.width, y: b.y / c.height, w: b.width / c.width, h: b.height / c.height }; });
+    },
+  },
+  tess: {
+    backend: 'tesseract.js',
+    async load() {
+      if (!window.Tesseract) await loadScript(TESS_URL);
+      this.worker = await Tesseract.createWorker('eng');
+    },
+    async find(c) {
+      const { data } = await this.worker.recognize(c);
+      return (data.words || []).filter((wd) => wd.confidence > 20).map((wd) => {
+        const b = wd.bbox;
+        return { x: b.x0 / c.width, y: b.y0 / c.height, w: (b.x1 - b.x0) / c.width, h: (b.y1 - b.y0) / c.height };
+      });
+    },
+  },
+};
+if (!finders.native.available) { const b = document.querySelector('[data-engine=native]'); b.disabled = true; b.title = 'TextDetector is not available in this browser'; }
+
+let engine = null, engineSeq = 0, busy = false, lastStart = -1e9;
+async function setEngine(name) {
+  const f = finders[name];
+  if (!f || (name === 'native' && !f.available)) return;
+  const seq = ++engineSeq;
+  engine = null;
+  for (const b of dock.querySelectorAll('[data-engine]')) b.classList.toggle('on', b.dataset.engine === name);
+  S.detMs = 0; S.detHz = 0; S.lastDone = 0;
+  if (!f.ready) {
+    notice('Loading the text finder…', 0);
+    try { await (f.loading || (f.loading = f.load())); f.ready = true; }
+    catch (e) { f.loading = null; console.error(e); if (seq === engineSeq) notice('Could not load this finder.\n' + (e.message || e), 6000); return; }
+  }
+  if (seq !== engineSeq) return;
+  engine = name;
+  notice('Point at some text', 3000);
+}
+for (const b of dock.querySelectorAll('[data-engine]')) b.addEventListener('click', () => setEngine(b.dataset.engine));
+
+// ---------- boxes and tracking ----------
+// Boxes live in 0..1 of the video frame. Between detections they follow the picture by block matching
+// on a small gray copy of each frame.
+const T = { prev: null, cur: null };
+let boxes = [];
+const FADE_IN = 0.06, FADE_OUT = 0.3;
+
+function trackBox(a, b, bx, R) {
+  const tw = W.tw, th = W.th;
+  const x0 = bx.x * tw, y0 = bx.y * th, bw = bx.w * tw, bh = bx.h * th;
+  const nx = Math.max(2, Math.min(16, Math.round(bw))), ny = Math.max(2, Math.min(12, Math.round(bh)));
+  const xs = [], ys = [];
+  for (let i = 0; i < nx; i++) xs.push(Math.round(x0 + (i + 0.5) * bw / nx));
+  for (let j = 0; j < ny; j++) ys.push(Math.round(y0 + (j + 0.5) * bh / ny));
+  // template from the previous frame; skip flat patches (nothing to lock on to)
+  const tpl = [], idx = [];
+  let mean = 0;
+  for (const y of ys) for (const x of xs) {
+    if (x < R || y < R || x >= tw - R || y >= th - R) continue;
+    const v = a[y * tw + x]; tpl.push(v); idx.push(y * tw + x); mean += v;
+  }
+  if (tpl.length < 4) return;
+  mean /= tpl.length;
+  let vari = 0; for (const v of tpl) vari += (v - mean) * (v - mean);
+  if (vari / tpl.length < 20) return;
+  const D = 2 * R + 1, cost = new Float32Array(D * D);
+  let best = Infinity, bi = 0;
+  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+    const off = dy * tw + dx;
+    let s = 0;
+    for (let k = 0; k < idx.length; k++) s += Math.abs(b[idx[k] + off] - tpl[k]);
+    const ci = (dy + R) * D + dx + R;
+    cost[ci] = s;
+    if (s < best) { best = s; bi = ci; }
+  }
+  let dx = (bi % D) - R, dy = ((bi / D) | 0) - R;
+  // sub-pixel refinement by fitting a parabola through the neighbours
+  const cx = bi % D, cy = (bi / D) | 0;
+  if (cx > 0 && cx < D - 1) { const l = cost[bi - 1], r = cost[bi + 1], den = l - 2 * best + r; if (den > 0) dx += 0.5 * (l - r) / den; }
+  if (cy > 0 && cy < D - 1) { const u = cost[bi - D], d = cost[bi + D], den = u - 2 * best + d; if (den > 0) dy += 0.5 * (u - d) / den; }
+  bx.x += dx / tw; bx.y += dy / th;
+}
+
+function iou(a, b) {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const i = ix * iy;
+  return i / (a.w * a.h + b.w * b.h - i + 1e-9);
+}
+
+function mergeBoxes(found) {
+  const next = [], used = new Set();
+  for (const nb of found) {
+    let best = 0.2, match = null;
+    for (const ob of boxes) { if (used.has(ob) || ob.dying) continue; const v = iou(nb, ob); if (v > best) { best = v; match = ob; } }
+    if (match) used.add(match);
+    next.push({ ...nb, alpha: match ? match.alpha : 0, dying: false });
+  }
+  for (const ob of boxes) if (!used.has(ob)) { ob.dying = true; next.push(ob); }
+  boxes = next;
+}
+
+// ---------- detection loop ----------
+let sizeLong = 480, rate = 5, pad = 0.05;
+const S = { fps: 0, lastFrame: 0, detMs: 0, detHz: 0, lastDone: 0, trackMs: 0 };
+
+function startDetect(now) {
+  busy = true; lastStart = now;
+  const name = engine, seq = engineSeq;
+  const k = sizeLong / Math.max(W.vw, W.vh);
+  // DBNet wants sides that are multiples of 32
+  input.width = Math.max(32, Math.round(W.vw * k / 32) * 32);
+  input.height = Math.max(32, Math.round(W.vh * k / 32) * 32);
+  ig.drawImage(video, 0, 0, input.width, input.height);
+  const snap = T.cur ? T.cur.slice() : null;
+  const t0 = performance.now();
+  finders[name].find(input).then((found) => {
+    if (seq !== engineSeq) return;
+    const t1 = performance.now();
+    S.detMs = S.detMs ? S.detMs * 0.8 + (t1 - t0) * 0.2 : t1 - t0;
+    if (S.lastDone) S.detHz = S.detHz ? S.detHz * 0.8 + 200 / (t1 - S.lastDone) : 1000 / (t1 - S.lastDone);
+    S.lastDone = t1;
+    found = found.filter((b) => b.w > 0 && b.h > 0);
+    // the picture moved while the finder was working: carry the new boxes from that frame to now
+    if (snap && T.cur) for (const b of found) trackBox(snap, T.cur, b, 12);
+    mergeBoxes(found);
+  }).catch((e) => {
+    console.error(e);
+    if (seq === engineSeq) notice('Text finder error: ' + (e.message || e), 5000);
+  }).finally(() => { busy = false; });
+}
+
+function readGray() {
+  pass(W.gray, P.gray);
+  bindTex(0, liveTex, P.gray.u.uLive);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.readPixels(0, 0, W.tw, W.th, gl.RGBA, gl.UNSIGNED_BYTE, W.px);
+  const g = new Uint8Array(W.tw * W.th);
+  for (let i = 0; i < g.length; i++) g[i] = W.px[i * 4];
+  T.prev = T.cur; T.cur = g;
+}
+
+// ---------- erase: mask + push-pull fill ----------
+function drawMask() {
+  const m = W.mask;
+  pass(m, P.box);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.MAX);
+  gl.uniform2f(P.box.u.uRes, m.w, m.h);
+  for (const b of boxes) {
+    if (b.alpha <= 0) continue;
+    // Hard edge (1 px anti-alias): the hole is just the padded text box, so the pixels right outside it,
+    // the sign's own background, are the ones pulled inwards. A wide soft edge would reach past the sign.
+    const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad, f = 1;
+    gl.uniform4f(P.box.u.uRect, b.x * m.w - p, b.y * m.h - p, (b.x + b.w) * m.w + p, (b.y + b.h) * m.h + p);
+    gl.uniform1f(P.box.u.uFeather, f);
+    gl.uniform1f(P.box.u.uAlpha, b.alpha);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  gl.disable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+}
+
+// Stretch: jump flooding finds, for each hole pixel, the nearest pixel outside the hole.
+function fillStretch() {
+  pass(W.jfa[0], P.jseed);
+  bindTex(0, W.mask.tex, P.jseed.u.uMask);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  let src = 0;
+  let step = 1; while (step * 2 < Math.max(W.mask.w, W.mask.h)) step *= 2;
+  const steps = [];
+  for (; step >= 1; step >>= 1) steps.push(step);
+  steps.push(1); // one extra pass at 1 px cleans up the leftovers
+  for (const k of steps) {
+    pass(W.jfa[1 - src], P.jstep);
+    bindTex(0, W.jfa[src].tex, P.jstep.u.uSrc);
+    gl.uniform1f(P.jstep.u.uStep, k);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    src = 1 - src;
+  }
+  pass(W.out, P.stretch);
+  bindTex(0, W.jfa[src].tex, P.stretch.u.uSeeds);
+  bindTex(1, liveTex, P.stretch.u.uLive);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  return W.out;
+}
+
+// Smooth: push-pull pyramid (average of the surroundings, blurrier, leaks colour across edges).
+function fillSmooth() {
+  pass(W.down[0], P.seed);
+  bindTex(0, liveTex, P.seed.u.uLive);
+  bindTex(1, W.mask.tex, P.seed.u.uMask);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  const L = W.down.length;
+  for (let i = 1; i < L; i++) {
+    pass(W.down[i], P.down);
+    bindTex(0, W.down[i - 1].tex, P.down.u.uSrc);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  let coarse = W.down[L - 1];
+  for (let i = L - 2; i >= 0; i--) {
+    pass(W.up[i], P.up);
+    bindTex(0, W.down[i].tex, P.up.u.uFine);
+    bindTex(1, coarse.tex, P.up.u.uCoarse);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    coarse = W.up[i];
+  }
+  return W.up[0];
+}
+
+// ---------- UI ----------
+let erase = true, showBoxes = false, fillMode = params.get('fill') === 'smooth' ? 'smooth' : 'stretch';
+for (const b of dock.querySelectorAll('[data-fill]')) {
+  b.classList.toggle('on', b.dataset.fill === fillMode);
+  b.addEventListener('click', () => { fillMode = b.dataset.fill; for (const c of dock.querySelectorAll('[data-fill]')) c.classList.toggle('on', c === b); });
+}
+function toggle(id, get, set) {
+  $(id).addEventListener('click', (ev) => { set(!get()); ev.currentTarget.classList.toggle('on', get()); ev.currentTarget.setAttribute('aria-pressed', get()); });
+}
+toggle('erase', () => erase, (v) => { erase = v; });
+toggle('boxes', () => showBoxes, (v) => { showBoxes = v; });
+$('fold').addEventListener('click', (ev) => {
+  const folded = dock.classList.toggle('folded');
+  ev.currentTarget.setAttribute('aria-expanded', !folded);
+  ev.currentTarget.setAttribute('aria-label', folded ? 'Show controls' : 'Hide controls');
+});
+$('size').addEventListener('input', (ev) => { sizeLong = +ev.target.value; $('sizeOut').textContent = sizeLong; });
+$('rate').addEventListener('input', (ev) => { rate = +ev.target.value; $('rateOut').textContent = rate + '/s'; });
+$('pad').addEventListener('input', (ev) => { pad = ev.target.value / 100; $('padOut').textContent = ev.target.value + '%'; });
+
+function drawOverlay(cover) {
+  og.clearRect(0, 0, viewW, viewH);
+  if (!showBoxes) return;
+  const toScreen = (u, v) => {
+    if (mirror) u = 1 - u;
+    return [((u - 0.5) / cover[0] + 0.5) * viewW, ((v - 0.5) / cover[1] + 0.5) * viewH];
+  };
+  og.setLineDash([4, 3]);
+  for (const b of boxes) {
+    if (b.dying) continue;
+    const [ax, ay] = toScreen(b.x, b.y), [bx, by] = toScreen(b.x + b.w, b.y + b.h);
+    const x = Math.min(ax, bx), y = Math.min(ay, by), w = Math.abs(bx - ax), h = by - ay;
+    og.lineWidth = 3; og.strokeStyle = '#fff'; og.strokeRect(x, y, w, h);
+    og.lineWidth = 1; og.strokeStyle = '#111'; og.strokeRect(x, y, w, h);
+  }
+  og.setLineDash([]);
+}
+
+// ---------- frame loop ----------
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!ok) return;
+  const dt = S.lastFrame ? Math.min((now - S.lastFrame) / 1000, 0.1) : 0;
+  if (dt > 0) S.fps = S.fps ? S.fps * 0.95 + 0.05 / dt : 1 / dt;
+  S.lastFrame = now;
+  const live = source && video.readyState >= 2 && video.videoWidth;
+  if (!live) { pass(null, P.show); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); return; }
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (vw !== W.vw || vh !== W.vh) { allocWork(vw, vh); boxes = []; }
+  gl.bindTexture(gl.TEXTURE_2D, liveTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+  const t0 = performance.now();
+  readGray();
+  if (T.prev) for (const b of boxes) trackBox(T.prev, T.cur, b, 5);
+  S.trackMs = S.trackMs * 0.9 + (performance.now() - t0) * 0.1;
+  for (let i = boxes.length - 1; i >= 0; i--) {
+    const b = boxes[i];
+    b.alpha = b.dying ? b.alpha - dt / FADE_OUT : Math.min(1, b.alpha + dt / FADE_IN);
+    if (b.alpha <= 0 && b.dying) boxes.splice(i, 1);
+  }
+  if (engine && !busy && now - lastStart >= 1000 / rate) startDetect(now);
+
+  let filled = W.up[0];
+  if (erase) { drawMask(); filled = fillMode === 'stretch' ? fillStretch() : fillSmooth(); }
+  const sa = viewW / viewH, va = vw / vh;
+  const cover = va > sa ? [sa / va, 1] : [1, va / sa];
+  pass(null, P.show);
+  bindTex(0, liveTex, P.show.u.uLive);
+  bindTex(1, W.mask.tex, P.show.u.uMask);
+  bindTex(2, filled.tex, P.show.u.uFill);
+  gl.uniform1f(P.show.u.uErase, erase ? 1 : 0);
+  gl.uniform2f(P.show.u.uCover, cover[0], cover[1]);
+  gl.uniform1f(P.show.u.uMirror, mirror ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  drawOverlay(cover);
+
+  if (!frame.n || now - frame.n > 250) {
+    frame.n = now;
+    const be = engine ? finders[engine].backend : '';
+    statsEl.textContent = `${S.fps.toFixed(0)} fps · find ${S.detMs.toFixed(0)} ms · ${S.detHz.toFixed(1)}/s · ${boxes.filter((b) => !b.dying).length} boxes${be ? ' · ' + be : ''}`;
+  }
+}
+requestAnimationFrame(frame);
+
+if (TEST) window.__te = { S, get boxes() { return boxes; }, get engine() { return engine; }, finders, setEngine };
+</script>
+</body>
+</html>

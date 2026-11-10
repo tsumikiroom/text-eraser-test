@@ -179,9 +179,16 @@ input[type=range]::-moz-range-thumb {
     </div>
     <div class="engine fillrow"><span>Fill</span>
       <div class="seg">
-        <button data-fill="solid" class="on">Solid</button>
+        <button data-fill="auto" class="on">Auto</button>
+        <button data-fill="solid">Solid</button>
         <button data-fill="stretch">Stretch</button>
         <button data-fill="smooth">Smooth</button>
+      </div>
+    </div>
+    <div class="engine fillrow"><span>Mask</span>
+      <div class="seg">
+        <button data-mask="shape" class="on">Shape</button>
+        <button data-mask="box">Box</button>
       </div>
     </div>
     <label class="knob"><span>Size</span><input id="size" type="range" min="256" max="960" step="32" value="640" style="--tick: 4.5455%"><output id="sizeOut">640</output></label>
@@ -226,14 +233,35 @@ void main() {
 </script>
 <script type="x-shader/x-fragment" id="f-box">#version 300 es
 precision highp float;
+// One text box in the erase mask. With uShape on, only the letters are taken: a pixel counts when its colour
+// (in the live frame, right now) is nearer the box's text colour than its background colour. The test is
+// widened by 2 x uDil pixels so the soft edges of the strokes go too. The sign's own surface between the letters
+// stays live, and a box that sits a little off still takes exactly the letters under it.
 uniform vec4 uRect;
 uniform float uFeather;
 uniform float uAlpha;
+uniform sampler2D uLive;
+uniform vec3 uBg;
+uniform vec3 uTxt;
+uniform float uShape;
+uniform float uDil;
+uniform vec2 uRes;
 in vec2 vPx;
 out vec4 o;
+float letter(vec2 px) {
+  vec3 c = texture(uLive, px / uRes).rgb;
+  float db = distance(c, uBg), dt = distance(c, uTxt);
+  return smoothstep(-0.2, 0.1, (db - dt) / (db + dt + 1e-3));
+}
 void main() {
   float d = length(max(max(uRect.xy - vPx, vPx - uRect.zw), 0.0));
-  o = vec4((1.0 - smoothstep(0.0, uFeather, d)) * uAlpha);
+  float a = (1.0 - smoothstep(0.0, uFeather, d)) * uAlpha;
+  if (uShape > 0.5 && a > 0.0) {
+    float m = 0.0;
+    for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) m = max(m, letter(gl_FragCoord.xy + vec2(i, j) * uDil));
+    a *= smoothstep(0.05, 0.5, m); // firm edge: a half-taken stroke edge would leave a grey ghost
+  }
+  o = vec4(a);
 }
 </script>
 <script type="x-shader/x-fragment" id="f-gray">#version 300 es
@@ -254,12 +282,19 @@ void main() { o = vec4(uColor, 1.0); }
 </script>
 <script type="x-shader/x-fragment" id="f-seed">#version 300 es
 precision mediump float;
-// Pyramid level 0: the live picture, with weight 0 wherever the mask touches (the hole to fill).
+// Pyramid level 0: the live picture, with weight 0 wherever the mask touches (the hole to fill) and also 1.5 px
+// around it, so the soft grey edge of the letters is not averaged into the fill.
 uniform sampler2D uLive;
 uniform sampler2D uMask;
 in vec2 vUV;
 out vec4 o;
-void main() { o = vec4(texture(uLive, vUV).rgb, texture(uMask, vUV).r > 0.004 ? 0.0 : 1.0); }
+void main() {
+  vec2 t = 1.5 / vec2(textureSize(uMask, 0));
+  float m = texture(uMask, vUV).r;
+  m = max(m, max(texture(uMask, vUV + vec2(t.x, 0.0)).r, texture(uMask, vUV - vec2(t.x, 0.0)).r));
+  m = max(m, max(texture(uMask, vUV + vec2(0.0, t.y)).r, texture(uMask, vUV - vec2(0.0, t.y)).r));
+  o = vec4(texture(uLive, vUV).rgb, m > 0.004 ? 0.0 : 1.0);
+}
 </script>
 <script type="x-shader/x-fragment" id="f-down">#version 300 es
 precision mediump float;
@@ -371,12 +406,18 @@ precision mediump float;
 uniform sampler2D uLive;
 uniform sampler2D uMask;
 uniform sampler2D uFill;
+uniform sampler2D uFill2;
+uniform float uAuto;
 uniform float uErase;
 in vec2 vUV;
 out vec4 o;
 void main() {
-  vec3 c = texture(uLive, vUV).rgb;
-  if (uErase > 0.5) c = mix(c, texture(uFill, vUV).rgb, texture(uMask, vUV).r);
+  vec3 c = texture(uLive, vUV).rgb, f = texture(uFill, vUV).rgb;
+  // Auto: uFill is the box's flat background colour, uFill2 the smooth fill from the surroundings. Use the smooth
+  // one where it stays close to the background colour (keeps gentle shading, e.g. a screen or lit sign), and the
+  // flat colour where it drifts away (grey ghosts of the letters, wall leaking in across a large hole).
+  if (uAuto > 0.5) { vec3 sm = texture(uFill2, vUV).rgb; f = mix(sm, f, smoothstep(0.02, 0.05, distance(sm, f))); }
+  if (uErase > 0.5) c = mix(c, f, texture(uMask, vUV).r);
   o = vec4(c, 1.0);
 }
 </script>
@@ -387,7 +428,10 @@ const params = new URLSearchParams(location.search);
 const TEST = params.has('test');
 const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
 const TESS_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
-const MODEL_URL = 'models/ppocrv4_det.onnx';   // PaddleOCR PP-OCRv4 text detector (DBNet), finds text regions only
+// PaddleOCR text detector (DBNet), finds text regions only. ?model=v4 picks the older one for comparison.
+// DBNet thresholds: text-pixel threshold, box score threshold, how far boxes are grown back out (?th= ?bth= ?unclip=)
+const DB_OPT = { th: +params.get('th') || 0.3, bth: +params.get('bth') || 0.5, unclip: +params.get('unclip') || 1.5 };
+const MODEL_URL = params.get('model') === 'v4' ? 'models/ppocrv4_det.onnx' : 'models/ppocrv5_det.onnx';
 
 const $ = (id) => document.getElementById(id);
 const cv = $('stage'), over = $('over'), og = over.getContext('2d');
@@ -433,7 +477,7 @@ else {
   };
   try {
     P.gray = link('v-full', 'f-gray', ['uLive']);
-    P.box = link('v-box', 'f-box', ['uRect', 'uFeather', 'uAng', 'uAlpha', 'uRes']);
+    P.box = link('v-box', 'f-box', ['uRect', 'uFeather', 'uAng', 'uAlpha', 'uRes', 'uLive', 'uBg', 'uTxt', 'uShape', 'uDil']);
     P.seed = link('v-full', 'f-seed', ['uLive', 'uMask']);
     P.down = link('v-full', 'f-down', ['uSrc']);
     P.up = link('v-full', 'f-up', ['uFine', 'uCoarse']);
@@ -441,7 +485,7 @@ else {
     P.jstep = link('v-full', 'f-jstep', ['uSrc', 'uStep']);
     P.solid = link('v-box', 'f-solid', ['uRect', 'uFeather', 'uAng', 'uRes', 'uColor']);
     P.stretch = link('v-full', 'f-stretch', ['uSeeds', 'uLive']);
-    P.show = link('v-screen', 'f-show', ['uLive', 'uMask', 'uFill', 'uErase', 'uCover', 'uMirror']);
+    P.show = link('v-screen', 'f-show', ['uLive', 'uMask', 'uFill', 'uFill2', 'uAuto', 'uErase', 'uCover', 'uMirror']);
   } catch (e) {
     console.error(e);
     ok = false;
@@ -540,7 +584,7 @@ function stopSource() {
 // Test scene (?test=1): a street-ish wall with signs, drawn straight into the frame loop instead of a camera, so
 // the true position of every text line is known for the frame being processed. ?motion=fast adds fast panning,
 // zoom and a little rotation, like a phone moved by hand.
-const MOTION = ['fast', 'wild'].includes(params.get('motion')) ? params.get('motion') : 'slow', SCENE_SCALE = +params.get('scale') || 1; // ?scale=0.5: smaller text
+const MOTION = ['fast', 'wild', 'still'].includes(params.get('motion')) ? params.get('motion') : 'slow', SCENE_SCALE = +params.get('scale') || 1; // ?scale=0.5: smaller text
 let testScene = null;
 function sceneMatrix(t) {
   let dx, dy, sc = 1, r = 0;
@@ -558,8 +602,19 @@ function sceneMatrix(t) {
   const c = Math.cos(r) * sc, sn = Math.sin(r) * sc;
   return [c, sn, -sn, c, 480 + dx - c * 480 + sn * 270, 270 + dy - sn * 480 - c * 270]; // canvas setTransform order
 }
+// ?img=<same-origin path>: a photo instead of the drawn wall (static, with a slow handheld drift). No answer key,
+// so it is not scored; it is for looking at real text.
+const TEST_IMG = params.get('img');
 function makeTestScene() {
   testCanvas = testCanvas || document.createElement('canvas');
+  if (TEST_IMG) {
+    const img = new Image();
+    img.src = TEST_IMG;
+    testScene = { t0: performance.now(), img, signs: [], g: testCanvas.getContext('2d') };
+    testCanvas.width = 2; testCanvas.height = 2;
+    img.onload = () => { const k = 1280 / Math.max(img.width, img.height); testCanvas.width = Math.round(img.width * k); testCanvas.height = Math.round(img.height * k); };
+    return;
+  }
   testCanvas.width = 960; testCanvas.height = 540;
   const g = testCanvas.getContext('2d');
   const signs = [
@@ -569,20 +624,47 @@ function makeTestScene() {
     { x: 90, y: 260, w: 300, h: 200, bg: '#fafafa', fg: '#333', lines: ['Lorem ipsum dolor', 'sit amet, consectetur', 'adipiscing elit. 本日', 'のおすすめ'], font: '26px sans-serif' },
     { x: 560, y: 420, w: 300, h: 70, bg: '#f2e6c9', fg: '#3a2a1a', lines: ['Small print: open 7 days', 'tel 03-1234-5678'], font: '16px sans-serif' },
   ];
-  // tight glyph boxes of every line, in scene pixels (the "answer" the erase is scored against)
-  const lines = [];
-  for (const sg of signs) {
-    g.font = sg.font; g.textBaseline = 'middle';
-    const lh = sg.h / (sg.lines.length + 0.6);
-    sg.lines.forEach((l, i) => {
-      const m = g.measureText(l), x = sg.x + 20, y = sg.y + lh * (i + 0.8);
-      lines.push({ x0: x - m.actualBoundingBoxLeft, x1: x + m.actualBoundingBoxRight, y0: y - m.actualBoundingBoxAscent, y1: y + m.actualBoundingBoxDescent, text: l });
-    });
+  // ?signs=turned: vertical writing and strongly slanted signs instead
+  if (params.get('signs') === 'turned') signs.splice(0, signs.length,
+    { x: 60, y: 40, w: 330, h: 110, bg: '#f4f1e8', fg: '#1a1a1a', lines: ['OPEN DAILY', '10:00 - 20:00'], font: 'bold 36px sans-serif' },
+    { x: 425, y: 50, w: 80, h: 440, bg: '#1d3b2a', fg: '#ffffff', vert: true, lines: ['縦書きの看板です'], font: 'bold 40px sans-serif' },
+    { x: 560, y: 70, w: 360, h: 100, rot: 0.35, bg: '#d94f30', fg: '#fff7e0', lines: ['SLANTED 斜め'], font: 'bold 44px sans-serif' },
+    { x: 560, y: 300, w: 340, h: 150, rot: -0.5, bg: '#f2e6c9', fg: '#3a2a1a', lines: ['Tilted -30', '二行目のテキスト'], font: '34px sans-serif' },
+    { x: 80, y: 200, w: 300, h: 300, bg: '#fafafa', fg: '#333', vert: true, lines: ['たてがき', '二列目です', '三列目'], font: '36px sans-serif' },
+  );
+  testScene = { t0: performance.now(), g, signs };
+}
+// Draw one sign in scene coordinates: board (unless textOnly) and its text. Signs may be turned (rot) or written
+// vertically (vert: one column per entry of lines, right to left). fill(i) sets the colour of line i.
+function drawSign(g, s, fill, textOnly) {
+  g.save();
+  g.translate(s.x + s.w / 2, s.y + s.h / 2); g.rotate(s.rot || 0); g.translate(-s.w / 2, -s.h / 2);
+  if (!textOnly) {
+    g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(6, 6, s.w, s.h);
+    g.fillStyle = s.bg; g.fillRect(0, 0, s.w, s.h);
   }
-  testScene = { t0: performance.now(), g, signs, lines };
+  g.font = s.font; g.textBaseline = 'middle';
+  if (s.vert) {
+    g.textAlign = 'center';
+    const cw = s.w / (s.lines.length + 0.3), step = parseFloat(s.font.match(/(\d+)px/)[1]) * 1.15;
+    s.lines.forEach((l, i) => { fill(i); [...l].forEach((ch, k) => g.fillText(ch, s.w - cw * (i + 0.65), step * (k + 0.7))); });
+  } else {
+    g.textAlign = 'left';
+    const lh = s.h / (s.lines.length + 0.6);
+    s.lines.forEach((l, i) => { fill(i); g.fillText(l, 20, lh * (i + 0.8)); });
+  }
+  g.restore();
 }
 function drawTestScene(t) {
   const { g, signs } = testScene;
+  if (testScene.img) {
+    const w = testCanvas.width, h = testCanvas.height;
+    g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = '#000'; g.fillRect(0, 0, w, h);
+    if (!testScene.img.complete || w < 3) return;
+    g.setTransform(...imageMatrix(t));
+    g.drawImage(testScene.img, 0, 0, w, h);
+    return;
+  }
   g.setTransform(1, 0, 0, 1, 0, 0);
   const sky = g.createLinearGradient(0, 0, 0, 540);
   sky.addColorStop(0, '#8fb3c9'); sky.addColorStop(1, '#c9b79c');
@@ -594,60 +676,71 @@ function drawTestScene(t) {
     g.fillStyle = `hsl(${18 + (((x + 240) * 7 + (y + 240) * 3) % 11)} 35% ${42 + (((x + 240) * 13 + (y + 240) * 5) % 9)}%)`;
     g.fillRect(x, y, 58, 28);
   }
-  for (const s of signs) {
-    g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(s.x + 6, s.y + 6, s.w, s.h);
-    g.fillStyle = s.bg; g.fillRect(s.x, s.y, s.w, s.h);
-    g.fillStyle = s.fg; g.font = s.font; g.textBaseline = 'middle';
-    const lh = s.h / (s.lines.length + 0.6);
-    s.lines.forEach((l, i) => g.fillText(l, s.x + 20, s.y + lh * (i + 0.8)));
-  }
+  for (const s of signs) drawSign(g, s, () => { g.fillStyle = s.fg; });
 }
 // Test only: how far the estimated frame-to-frame motion puts points, compared with the scene's true motion
 // (mean over a 5x3 grid, in tracking pixels).
+function imageMatrix(t) { // the drift drawTestScene gives a photo, as a canvas transform
+  const w = testCanvas.width, h = testCanvas.height, slow = MOTION === 'slow';
+  if (MOTION === 'still') return [1, 0, 0, 1, 0, 0];
+  const sc = slow ? 1.08 : 1.15, dx = Math.sin(t * (slow ? 0.4 : 1.3)) * w * 0.03, dy = Math.cos(t * (slow ? 0.3 : 1.1)) * h * 0.02;
+  return [sc, 0, 0, sc, w / 2 * (1 - sc) + dx, h / 2 * (1 - sc) + dy];
+}
 function motionError(t1, t2, m) {
-  const A = sceneMatrix(t1), B = sceneMatrix(t2), k = W.tw / 960;
+  const cw = testCanvas.width, ch = testCanvas.height, mat = TEST_IMG ? imageMatrix : sceneMatrix;
+  const A = mat(t1), B = mat(t2), k = W.tw / cw;
   const det = A[0] * A[3] - A[1] * A[2];
   let e = 0;
   for (let j = 0; j < 3; j++) for (let i = 0; i < 5; i++) {
-    const X = (i + 0.5) / 5 * 960, Y = (j + 0.5) / 3 * 540; // video pixel at t1 -> scene point -> video pixel at t2
+    const X = (i + 0.5) / 5 * cw, Y = (j + 0.5) / 3 * ch; // video pixel at t1 -> scene point -> video pixel at t2
     const dx = X - A[4], dy = Y - A[5];
     const sx = (A[3] * dx - A[2] * dy) / det, sy = (-A[1] * dx + A[0] * dy) / det;
     const tx = (B[0] * sx + B[2] * sy + B[4]) * k, ty = (B[1] * sx + B[3] * sy + B[5]) * k;
     const x = X * k, y = Y * k;
     e += Math.hypot(m[0] * x - m[1] * y + m[2] - tx, m[1] * x + m[0] * y + m[3] - ty);
   }
-  SCORE.merr += e / 15; SCORE.mn++;
+  SCORE.merr += e / 15; SCORE.mn++; if (e / 15 > 2) SCORE.mbig++; // > 2 px: boxes visibly off
 }
-// Score of the current frame: the share of text (points spread over every visible line's glyph box) that lies
-// under an erase box, and the share of lines that are erased almost fully.
-const SCORE = { frames: 0, cov: 0, full: 0, lines: 0, merr: 0, mn: 0 };
+// Score of the current frame, from what is really erased: the scene's letters are drawn into a separate canvas at
+// the mask's size (each line in its own colour), and compared with the erase mask read back from the GPU.
+// cov = share of letter pixels under the mask, full = share of lines with 95% or more of their letter pixels
+// erased, area = masked pixels / letter pixels (how much more than the letters gets painted).
+const SCORE = { frames: 0, cov: 0, full: 0, lines: 0, area: 0, merr: 0, mn: 0, mbig: 0 };
+let truthCv = null, truthG = null, maskPx = null;
 function scoreFrame(t) {
-  const M = sceneMatrix(t), mw = W.mask.w, mh = W.mask.h;
-  const sa = viewW / viewH, va = W.vw / W.vh, c = va > sa ? [sa / va, 1] : [1, va / sa];
-  const vis = [0.5 - c[0] / 2, 0.5 - c[1] / 2, 0.5 + c[0] / 2, 0.5 + c[1] / 2]; // only text that is on screen counts
-  const rects = boxes.filter((b) => b.alpha > 0.5).map((b) => {
-    const p = Math.min(b.w * mw, b.h * mh) * pad;
-    return { cx: (b.x + b.w / 2) * mw, cy: (b.y + b.h / 2) * mh, hw: b.w * mw / 2 + p, hh: b.h * mh / 2 + p, c: Math.cos(b.a || 0), s: Math.sin(b.a || 0) };
-  });
-  const inside = (u, v) => rects.some((r) => {
-    const dx = u * mw - r.cx, dy = v * mh - r.cy;
-    return Math.abs(r.c * dx + r.s * dy) <= r.hw && Math.abs(-r.s * dx + r.c * dy) <= r.hh;
-  });
-  let cov = 0, full = 0, n = 0;
-  for (const l of testScene.lines) {
-    let hit = 0, tot = 0;
-    for (let j = 0; j < 3; j++) for (let i = 0; i < 12; i++) {
-      const x = l.x0 + (i + 0.5) / 12 * (l.x1 - l.x0), y = l.y0 + (j + 0.5) / 3 * (l.y1 - l.y0);
-      const u = (M[0] * x + M[2] * y + M[4]) / 960, v = (M[1] * x + M[3] * y + M[5]) / 540;
-      if (u < vis[0] || v < vis[1] || u > vis[2] || v > vis[3]) continue;
-      tot++;
-      if (inside(u, v)) hit++;
-    }
-    if (tot < 18) continue; // mostly off screen
-    n++; cov += hit / tot; if (hit / tot > 0.95) full++;
+  const mw = W.mask.w, mh = W.mask.h;
+  if (!truthCv || truthCv.width !== mw || truthCv.height !== mh) {
+    truthCv = document.createElement('canvas'); truthCv.width = mw; truthCv.height = mh;
+    truthG = truthCv.getContext('2d', { willReadFrequently: true });
+    maskPx = new Uint8Array(mw * mh * 4);
   }
-  if (!n) return;
-  SCORE.frames++; SCORE.cov += cov / n; SCORE.full += full / n; SCORE.lines += n;
+  const g = truthG, M = sceneMatrix(t), kx = mw / 960, ky = mh / 540;
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, mw, mh);
+  if (!(MOTION === 'wild' && t % 6 > 5.2)) {
+    g.setTransform(M[0] * kx, M[1] * ky, M[2] * kx, M[3] * ky, M[4] * kx, M[5] * ky);
+    let idx = 0;
+    for (const sg of testScene.signs) drawSign(g, sg, () => { idx++; g.fillStyle = `rgb(${idx * 16},0,0)`; }, true);
+  }
+  const tp = g.getImageData(0, 0, mw, mh).data;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, W.mask.fbo);
+  gl.readPixels(0, 0, mw, mh, gl.RGBA, gl.UNSIGNED_BYTE, maskPx); // row 0 = top of the video, like the canvas
+  const sa = viewW / viewH, va = W.vw / W.vh, c = va > sa ? [sa / va, 1] : [1, va / sa];
+  const x0 = Math.ceil((0.5 - c[0] / 2) * mw), x1 = Math.floor((0.5 + c[0] / 2) * mw);
+  const y0 = Math.ceil((0.5 - c[1] / 2) * mh), y1 = Math.floor((0.5 + c[1] / 2) * mh); // only what is on screen counts
+  const tot = new Uint32Array(64), hit = new Uint32Array(64);
+  let masked = 0, glyph = 0, covered = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const i = (y * mw + x) * 4, m = maskPx[i] > 127;
+    if (m) masked++;
+    if (tp[i + 3] < 128) continue;
+    const id = Math.round(tp[i] / 16); // ids are 16 apart: edge pixels read back a little off after alpha rounding
+    glyph++; tot[id]++;
+    if (m) { covered++; hit[id]++; }
+  }
+  if (glyph < 50) return;
+  let n = 0, full = 0;
+  for (let id = 1; id < 64; id++) if (tot[id] >= 20) { n++; if (hit[id] >= 0.95 * tot[id]) full++; }
+  SCORE.frames++; SCORE.cov += covered / glyph; SCORE.full += n ? full / n : 0; SCORE.lines += n; SCORE.area += masked / glyph;
 }
 
 function explain(e) {
@@ -764,7 +857,7 @@ const finders = {
       const id = this.nextId++;
       return new Promise((res, rej) => {
         this.pending.set(id, { res, rej });
-        this.worker.postMessage({ type: 'find', id, w: c.width, h: c.height, px: img.data.buffer }, [img.data.buffer]);
+        this.worker.postMessage({ type: 'find', id, w: c.width, h: c.height, px: img.data.buffer, opt: DB_OPT }, [img.data.buffer]);
       });
     },
   },
@@ -865,6 +958,8 @@ function sad(A, B, w, h, x, y, ex, ey, r) {
   }
   return s;
 }
+const LAM = TEST && params.get('lam') !== null ? +params.get('lam') : 3; // per pixel of patch, per step squared
+const LAM_COARSE = TEST && params.get('lamc') !== null ? +params.get('lamc') : 1;
 function estimateMotion(P0, P1, guess) {
   const w = W.tw, h = W.th, pts = [], c = new Float32Array(81);
   const g0 = P0[0].g;
@@ -882,8 +977,11 @@ function estimateMotion(P0, P1, guess) {
       if (cx < r || cy < r || cx >= lw - r || cy >= lh - r) { okp = false; break; }
       const bx = Math.round(dx), by = Math.round(dy);
       let best = Infinity, bi = 0, bj = 0;
+      // Lines of text repeat: the next line often matches almost as well as the right spot. A small cost for
+      // straying from the expected place keeps the search from jumping a line.
+      const lam = (2 * r + 1) * (2 * r + 1) * LAM * (lv === 2 ? LAM_COARSE : 1); // weaker on the coarsest level, so big jumps can still be found
       for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) {
-        const v = sad(A, B, lw, lh, cx, cy, cx + bx + i, cy + by + j, r);
+        const v = sad(A, B, lw, lh, cx, cy, cx + bx + i, cy + by + j, r) + lam * (i * i + j * j);
         c[(j + R) * 9 + i + R] = v;
         if (v < best) { best = v; bi = i; bj = j; }
       }
@@ -975,7 +1073,7 @@ function mergeBoxes(found) {
     // a box that is still fading out can be picked up again, so one missed detection does not blink the text back
     for (const ob of boxes) { if (used.has(ob)) continue; const v = iou(nb, ob); if (v > best) { best = v; match = ob; } }
     if (match) used.add(match);
-    next.push({ ...nb, alpha: match ? match.alpha : 0, dying: false, col: match ? match.col : null });
+    next.push({ ...nb, alpha: match ? match.alpha : 0, dying: false, col: match ? match.col : null, txt: match ? match.txt : null });
   }
   for (const ob of boxes) if (!used.has(ob)) { if (!ob.dying) { ob.dying = true; ob.hold = HOLD; } next.push(ob); }
   boxes = next;
@@ -1003,7 +1101,7 @@ function startDetect(now) {
   input.width = Math.max(32, Math.round(sw * k / 32) * 32);
   input.height = Math.max(32, Math.round(sh * k / 32) * 32);
   ig.drawImage(source === 'test' ? testCanvas : video, u0 * W.vw, v0 * W.vh, sw, sh, 0, 0, input.width, input.height);
-  const snapPyr = T.pyr, snapFrame = T.frame;
+  const snapPyr = T.pyr, snapFrame = T.frame, snapT = source === 'test' ? (now - testScene.t0) / 1000 : 0;
   const t0 = performance.now();
   // ?lag=ms (test only) holds each result back, to imitate a phone whose finder is slower than this PC's
   const lag = TEST ? +params.get('lag') || 0 : 0;
@@ -1013,7 +1111,14 @@ function startDetect(now) {
     S.detMs = S.detMs ? S.detMs * 0.8 + (t1 - t0) * 0.2 : t1 - t0;
     if (S.lastDone) S.detHz = S.detHz ? S.detHz * 0.8 + 200 / (t1 - S.lastDone) : 1000 / (t1 - S.lastDone);
     S.lastDone = t1;
-    found = found.filter((b) => b.w > 0 && b.h > 0).map((b) => ({ x: u0 + b.x * uw, y: v0 + b.y * vh, w: b.w * uw, h: b.h * vh }));
+    S.found = found.length; // raw count from the finder (shown to tests)
+    // into 0..1 of the whole video. Paddle gives turned boxes in input pixels; the other finders upright 0..1 boxes.
+    const kx = uw * W.vw / input.width, ky = vh * W.vh / input.height, kk = (kx + ky) / 2; // input px -> video px
+    found = found.filter((b) => b.w > 0 && b.h > 0).map((b) => {
+      if (b.cx === undefined) return { x: u0 + b.x * uw, y: v0 + b.y * vh, w: b.w * uw, h: b.h * vh, a: 0 };
+      const w = b.w * kk / W.vw, h = b.h * kk / W.vh;
+      return { x: u0 + b.cx * kx / W.vw - w / 2, y: v0 + b.cy * ky / W.vh - h / 2, w, h, a: b.a };
+    });
     if (snapPyr && T.pyr && snapPyr[0].w === W.tw && snapPyr[0].h === W.th) {
       // The picture moved while the finder was working. Measure the motion from the frame it looked at to now
       // (starting from the frame-by-frame steps since then), and make that frame the new reference frame.
@@ -1023,9 +1128,9 @@ function startDetect(now) {
       if (!m || !plausibleKey(m)) m = plausibleKey(g) ? g : [1, 0, 0, 0];
       const inv = inverse(m);
       for (const b of boxes) b.base = posed(b, inv);
-      T.key = snapPyr; T.mk = m; T.lost = 0;
-      found = found.map((b) => ({ ...posed(b, m), base: { ...b, a: 0 } }));
-    } else found = found.map((b) => ({ ...b, a: 0, base: { ...b, a: 0 } }));
+      T.key = snapPyr; T.mk = m; T.lost = 0; T.keyT = snapT;
+      found = found.map((b) => ({ ...posed(b, m), base: { ...b } }));
+    } else found = found.map((b) => ({ ...b, base: { ...b } }));
     mergeBoxes(found);
   }).catch((e) => {
     console.error(e);
@@ -1050,19 +1155,13 @@ function readGray() {
 // more of the box than the letter strokes do. Looking inside (not at a ring outside) matters when the text fills
 // most of the sign: a ring outside would land on the wall. Colours are counted in a coarse 8x8x8 grid; the
 // winning cell (with its neighbours, so a colour on a cell border is not split) gives the starting estimate.
+// The text colour is found the same way among the pixels that are clearly not background.
 const HIST = new Float32Array(512);
-function boxColor(b) {
-  const tw = W.tw, th = W.th, px = T.rgb;
-  const ax = Math.max(0, Math.floor(b.x * tw - 1)), ay = Math.max(0, Math.floor(b.y * th - 1));
-  const bx = Math.min(tw - 1, Math.ceil((b.x + b.w) * tw)), by = Math.min(th - 1, Math.ceil((b.y + b.h) * th));
+function modeOf(px, pts, keep) {
   HIST.fill(0);
-  const pts = [];
-  for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) {
-    const i = (y * tw + x) * 4;
-    const k = ((px[i] >> 5) << 6) | ((px[i + 1] >> 5) << 3) | (px[i + 2] >> 5);
-    HIST[k]++; pts.push(i, k);
-  }
-  if (!pts.length) return null;
+  let n = 0;
+  for (let j = 0; j < pts.length; j += 2) if (keep(pts[j])) { HIST[pts[j + 1]]++; n++; }
+  if (!n) return null;
   let best = -1, bk = 0;
   for (let k = 0; k < 512; k++) {
     if (!HIST[k]) continue;
@@ -1075,21 +1174,43 @@ function boxColor(b) {
     }
     if (s > best) { best = s; bk = k; }
   }
-  const r0 = bk >> 6, g0 = (bk >> 3) & 7, b0 = bk & 7;
   // start from the winning cell's centre, then twice average only the pixels close to the current estimate,
-  // so shadows and wall at the ring's edge (often in a neighbouring cell) do not darken the result
-  let m = [r0 * 32 + 16, g0 * 32 + 16, b0 * 32 + 16];
+  // so shadows and wall at the box's edge (often in a neighbouring cell) do not pull the result
+  let m = [(bk >> 6) * 32 + 16, ((bk >> 3) & 7) * 32 + 16, (bk & 7) * 32 + 16], cnt = 0;
   for (const lim of [40, 20]) {
-    let sr = 0, sg = 0, sb = 0, n = 0;
+    let sr = 0, sg = 0, sb = 0, c = 0;
     for (let j = 0; j < pts.length; j += 2) {
-      const i = pts[j], dr = px[i] - m[0], dg = px[i + 1] - m[1], db = px[i + 2] - m[2];
+      const i = pts[j];
+      if (!keep(i)) continue;
+      const dr = px[i] - m[0], dg = px[i + 1] - m[1], db = px[i + 2] - m[2];
       if (dr * dr + dg * dg + db * db > lim * lim) continue;
-      sr += px[i]; sg += px[i + 1]; sb += px[i + 2]; n++;
+      sr += px[i]; sg += px[i + 1]; sb += px[i + 2]; c++;
     }
-    if (!n) break;
-    m = [sr / n, sg / n, sb / n];
+    if (!c) break;
+    m = [sr / c, sg / c, sb / c]; cnt = c;
   }
-  return [m[0] / 255, m[1] / 255, m[2] / 255];
+  return { m, n: cnt };
+}
+function boxColor(b) {
+  const tw = W.tw, th = W.th, px = T.rgb;
+  const cx = (b.x + b.w / 2) * tw, cy = (b.y + b.h / 2) * th, hw = b.w * tw / 2 + 1, hh = b.h * th / 2 + 1;
+  const c = Math.cos(b.a || 0), s = Math.sin(b.a || 0), ex = Math.abs(c) * hw + Math.abs(s) * hh, ey = Math.abs(s) * hw + Math.abs(c) * hh;
+  const ax = Math.max(0, Math.floor(cx - ex)), ay = Math.max(0, Math.floor(cy - ey));
+  const bx = Math.min(tw - 1, Math.ceil(cx + ex)), by = Math.min(th - 1, Math.ceil(cy + ey));
+  const pts = [];
+  for (let y = ay; y <= by; y++) for (let x = ax; x <= bx; x++) {
+    const dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+    if (Math.abs(c * dx + s * dy) > hw || Math.abs(-s * dx + c * dy) > hh) continue; // outside the turned box
+    const i = (y * tw + x) * 4;
+    pts.push(i, ((px[i] >> 5) << 6) | ((px[i + 1] >> 5) << 3) | (px[i + 2] >> 5));
+  }
+  if (!pts.length) return null;
+  const bg = modeOf(px, pts, () => true).m;
+  // text: the most common colour among pixels at least 60 away from the background (at least 2% of the box)
+  const far = (i) => { const dr = px[i] - bg[0], dg = px[i + 1] - bg[1], db = px[i + 2] - bg[2]; return dr * dr + dg * dg + db * db > 3600; };
+  const tx = modeOf(px, pts, far);
+  const txt = tx && tx.n >= Math.max(2, pts.length / 2 * 0.02) ? tx.m.map((v) => v / 255) : null;
+  return { bg: bg.map((v) => v / 255), txt };
 }
 
 // Update each live box's colour, smoothed over time so it does not flicker as the camera noise changes.
@@ -1099,8 +1220,12 @@ function updateColors(dt) {
     if (b.dying && b.col) continue; // keep the last colour while it fades out
     const c = boxColor(b);
     if (!c) continue;
-    if (!b.col) b.col = c;
-    else for (let i = 0; i < 3; i++) b.col[i] += (c[i] - b.col[i]) * a;
+    if (!b.col) b.col = c.bg;
+    else for (let i = 0; i < 3; i++) b.col[i] += (c.bg[i] - b.col[i]) * a;
+    if (c.txt) {
+      if (!b.txt) b.txt = c.txt;
+      else for (let i = 0; i < 3; i++) b.txt[i] += (c.txt[i] - b.txt[i]) * a;
+    }
   }
 }
 
@@ -1113,8 +1238,15 @@ function drawMask() {
   gl.enable(gl.BLEND);
   gl.blendEquation(gl.MAX);
   gl.uniform2f(P.box.u.uRes, m.w, m.h);
+  bindTex(0, liveTex, P.box.u.uLive);
+  gl.uniform1f(P.box.u.uDil, 1.0);
   for (const b of boxes) {
     if (b.alpha <= 0 || !b.col) continue; // no colour yet = box entirely off the frame: nothing to cover
+    // letters only when the text stands out from its background; otherwise (no clear text colour) the whole box
+    const shape = maskMode === 'shape' && b.txt && Math.hypot(b.txt[0] - b.col[0], b.txt[1] - b.col[1], b.txt[2] - b.col[2]) > 0.15;
+    gl.uniform1f(P.box.u.uShape, shape ? 1 : 0);
+    gl.uniform3f(P.box.u.uBg, b.col[0], b.col[1], b.col[2]);
+    if (b.txt) gl.uniform3f(P.box.u.uTxt, b.txt[0], b.txt[1], b.txt[2]);
     // Hard edge (1 px anti-alias): the hole is just the padded text box, so the pixels right outside it,
     // the sign's own background, are the ones pulled inwards. A wide soft edge would reach past the sign.
     const bh = Math.min(b.w * m.w, b.h * m.h), p = bh * pad, f = 1;
@@ -1193,7 +1325,12 @@ function fillSmooth() {
 }
 
 // ---------- UI ----------
-let erase = true, showBoxes = false, fillMode = ['stretch', 'smooth'].includes(params.get('fill')) ? params.get('fill') : 'solid';
+let maskMode = params.get('mask') === 'box' ? 'box' : 'shape';
+for (const b of dock.querySelectorAll('[data-mask]')) {
+  b.classList.toggle('on', b.dataset.mask === maskMode);
+  b.addEventListener('click', () => { maskMode = b.dataset.mask; for (const c of dock.querySelectorAll('[data-mask]')) c.classList.toggle('on', c === b); });
+}
+let erase = true, showBoxes = false, fillMode = ['solid', 'stretch', 'smooth'].includes(params.get('fill')) ? params.get('fill') : 'auto';
 for (const b of dock.querySelectorAll('[data-fill]')) {
   b.classList.toggle('on', b.dataset.fill === fillMode);
   b.addEventListener('click', () => { fillMode = b.dataset.fill; for (const c of dock.querySelectorAll('[data-fill]')) c.classList.toggle('on', c === b); });
@@ -1263,7 +1400,7 @@ function frame(now) {
     const st = estimateMotion(T.ppyr, T.pyr, T.vel);
     T.vel = st && plausibleStep(st) ? st : [1, 0, 0, 0];
   }
-  if (test && T.tPrev !== undefined) motionError(T.tPrev, (now - testScene.t0) / 1000, T.vel);
+  if (test && T.key && T.keyT !== undefined) motionError(T.keyT, (now - testScene.t0) / 1000, T.mk);
   if (test) T.tPrev = (now - testScene.t0) / 1000;
   T.hist.push({ f: T.frame, m: T.vel });
   if (T.hist.length > 180) T.hist.shift();
@@ -1277,16 +1414,23 @@ function frame(now) {
   }
   if (engine && !busy && now - lastStart >= 1000 / rate) startDetect(now);
   if (engine && busy && now - lastStart > Math.max(stallMs, 8 * S.detMs)) restartFinder();
-  if (test) scoreFrame((now - testScene.t0) / 1000);
 
   let filled = W.up[0];
-  if (erase) { drawMask(); filled = fillMode === 'solid' ? fillSolid() : fillMode === 'stretch' ? fillStretch() : fillSmooth(); }
+  let filled2 = W.up[0];
+  if (erase) {
+    drawMask();
+    if (fillMode === 'auto') { filled2 = fillSmooth(); filled = fillSolid(); }
+    else filled = fillMode === 'solid' ? fillSolid() : fillMode === 'stretch' ? fillStretch() : fillSmooth();
+  }
+  if (test && erase && !TEST_IMG) scoreFrame((now - testScene.t0) / 1000);
   const sa = viewW / viewH, va = vw / vh;
   const cover = va > sa ? [sa / va, 1] : [1, va / sa];
   pass(null, P.show);
   bindTex(0, liveTex, P.show.u.uLive);
   bindTex(1, W.mask.tex, P.show.u.uMask);
   bindTex(2, filled.tex, P.show.u.uFill);
+  bindTex(3, filled2.tex, P.show.u.uFill2);
+  gl.uniform1f(P.show.u.uAuto, fillMode === 'auto' ? 1 : 0);
   gl.uniform1f(P.show.u.uErase, erase ? 1 : 0);
   gl.uniform2f(P.show.u.uCover, cover[0], cover[1]);
   gl.uniform1f(P.show.u.uMirror, mirror ? 1 : 0);
